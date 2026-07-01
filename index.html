@@ -47,6 +47,24 @@
     }
     #splash svg { animation: spin 1.1s linear infinite; }
     @keyframes spin { to { transform: rotate(360deg); } }
+
+    #pf-update-banner {
+      position: fixed; left: 12px; right: 12px; bottom: 12px;
+      max-width: 420px; margin: 0 auto;
+      background: #111827; color: #fff;
+      border-radius: 12px; padding: 14px 16px;
+      display: none; align-items: center; gap: 12px;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.25);
+      z-index: 9999; font-family: system-ui, -apple-system, sans-serif;
+      padding-bottom: calc(14px + env(safe-area-inset-bottom));
+    }
+    #pf-update-banner.show { display: flex; }
+    #pf-update-banner span { flex: 1; font-size: 13px; line-height: 1.4; }
+    #pf-update-banner button {
+      flex-shrink: 0; background: #cc0000; color: #fff; border: none;
+      border-radius: 8px; padding: 8px 14px; font-size: 13px; font-weight: 600;
+      cursor: pointer;
+    }
   </style>
 </head>
 <body>
@@ -61,35 +79,131 @@
     </div>
   </div>
 
-  <script crossorigin src="https://unpkg.com/react@18.2.0/umd/react.production.min.js"></script>
-  <script crossorigin src="https://unpkg.com/react-dom@18.2.0/umd/react-dom.production.min.js"></script>
-  <script src="https://unpkg.com/@babel/standalone@7.24.7/babel.min.js"></script>
+  <div id="pf-update-banner">
+    <span>Hay una nueva versión de PF Stock disponible.</span>
+    <button id="pf-update-btn" type="button">Actualizar ahora</button>
+  </div>
+
+  <script crossorigin src="https://unpkg.com/react@18.2.0/umd/react.production.min.js"
+          onload="window.__pfReactLoaded=true" onerror="window.__pfReactError=true"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18.2.0/umd/react-dom.production.min.js"
+          onload="window.__pfReactDomLoaded=true" onerror="window.__pfReactDomError=true"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.24.7/babel.min.js"
+          onload="window.__pfBabelLoaded=true" onerror="window.__pfBabelError=true"></script>
 
   <script>
+    // ---- Service worker registration + in-app update banner ----
     if ('serviceWorker' in navigator) {
       window.addEventListener('load', function () {
         navigator.serviceWorker
-          .register('./service-worker.js', { scope: './' })
+          .register('/service-worker.js', { scope: '/' })
+          .then(function (reg) {
+            function showUpdateBanner(worker) {
+              var banner = document.getElementById('pf-update-banner');
+              var btn = document.getElementById('pf-update-btn');
+              if (!banner || !btn) return;
+              banner.classList.add('show');
+              btn.onclick = function () {
+                btn.disabled = true;
+                worker.postMessage({ type: 'SKIP_WAITING' });
+              };
+            }
+
+            // A previously-fetched update may already be waiting.
+            if (reg.waiting && navigator.serviceWorker.controller) {
+              showUpdateBanner(reg.waiting);
+            }
+
+            reg.addEventListener('updatefound', function () {
+              var newWorker = reg.installing;
+              if (!newWorker) return;
+              newWorker.addEventListener('statechange', function () {
+                if (newWorker.state === 'installed' && navigator.serviceWorker.controller) {
+                  showUpdateBanner(newWorker);
+                }
+              });
+            });
+          })
           .catch(function (err) { console.warn('[SW] registration failed:', err); });
+
+        // Reload once the new worker takes control — never in a loop,
+        // and only ever after the user clicks "Actualizar ahora".
+        var pfReloaded = false;
+        navigator.serviceWorker.addEventListener('controllerchange', function () {
+          if (pfReloaded) return;
+          pfReloaded = true;
+          window.location.reload();
+        });
       });
     }
   </script>
 
-  <script type="text/babel" src="./app.jsx" data-presets="react,env"></script>
-
-  <script type="text/babel" data-presets="react,env">
+  <script>
+    // ---- Safe React/ReactDOM/Babel readiness guard before running app.jsx ----
+    // app.jsx destructures window.React at its top level; if the CDN failed
+    // (network error, ad-blocker, preview sandbox, slow connection) it must
+    // never execute against an undefined React — show a clear error instead.
     (function () {
-      if (!window.__AppRoot) {
-        document.getElementById('root').innerHTML =
-          '<div style="padding:32px;font-family:system-ui;color:#b91c1c">' +
-          '<b>Error al cargar la aplicaci\u00f3n.</b> Recarga la p\u00e1gina.' +
-          '</div>';
-        return;
+      function fatal(msg) {
+        var el = document.getElementById('root');
+        if (el) {
+          el.innerHTML =
+            '<div style="padding:32px;font-family:system-ui;color:#b91c1c">' +
+            '<b>' + msg + '</b></div>';
+        }
       }
-      var splash = document.getElementById('splash');
-      if (splash) splash.remove();
-      var root = ReactDOM.createRoot(document.getElementById('root'));
-      root.render(React.createElement(window.__AppRoot));
+
+      function ready() {
+        return !!(window.React && window.ReactDOM && window.Babel);
+      }
+
+      function mount() {
+        if (!window.__AppRoot) {
+          fatal('Error al cargar la aplicaci\u00f3n. Recarga la p\u00e1gina.');
+          return;
+        }
+        var splash = document.getElementById('splash');
+        if (splash) splash.remove();
+        var root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(React.createElement(window.__AppRoot));
+      }
+
+      function loadApp() {
+        fetch('./app.jsx')
+          .then(function (res) {
+            if (!res.ok) throw new Error('HTTP ' + res.status);
+            return res.text();
+          })
+          .then(function (src) {
+            var compiled = window.Babel.transform(src, { presets: ['react', 'env'] }).code;
+            new Function(compiled)();
+            mount();
+          })
+          .catch(function (err) {
+            console.error('[PF Stock] app.jsx load/transform failed:', err);
+            fatal('No se pudo cargar la aplicaci\u00f3n. Recarga la p\u00e1gina.');
+          });
+      }
+
+      var tries = 0;
+      var maxTries = 100; // ~10s at 100ms poll interval
+
+      (function waitForReact() {
+        if (window.__pfReactError || window.__pfReactDomError || window.__pfBabelError) {
+          fatal('No se pudieron cargar los recursos necesarios (React/Babel). Verifica tu conexi\u00f3n y recarga la p\u00e1gina.');
+          return;
+        }
+        if (ready()) {
+          loadApp();
+          return;
+        }
+        tries++;
+        if (tries > maxTries) {
+          fatal('No se pudo inicializar React a tiempo. Verifica tu conexi\u00f3n y recarga la p\u00e1gina.');
+          return;
+        }
+        setTimeout(waitForReact, 100);
+      })();
     })();
   </script>
 </body>

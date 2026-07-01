@@ -1,12 +1,11 @@
 // PF Stock — Service Worker v0.9.0-beta
 // Shell: stale-while-revalidate | CDN: cache-first | Navigation: SPA fallback
 
-var SHELL_CACHE = 'pf-stock-shell-v1';
-var CDN_CACHE   = 'pf-stock-cdn-v1';
+var SHELL_CACHE = 'pf-stock-shell-v3';
+var CDN_CACHE   = 'pf-stock-cdn-v3';
 
 var SHELL_ASSETS = [
   './',
-  './index.html',
   './app.jsx',
   './manifest.json',
   './icons/icon-192x192.png',
@@ -23,9 +22,27 @@ var CDN_HOSTS = ['unpkg.com', 'cdnjs.cloudflare.com'];
 self.addEventListener('install', function (event) {
   event.waitUntil(
     caches.open(SHELL_CACHE)
-      .then(function (cache) { return cache.addAll(SHELL_ASSETS); })
+      .then(function (cache) {
+        return Promise.all(
+          SHELL_ASSETS.map(function (url) {
+            return fetch(url).then(function (response) {
+              // Never cache a redirected response — root cause of Safari
+              // "Response served by service worker has redirections".
+              if (response && response.ok && response.redirected === false) {
+                return cache.put(url, response.clone());
+              }
+            }).catch(function () { /* asset unavailable offline at install time; skip */ });
+          })
+        );
+      })
       .then(function () { return self.skipWaiting(); })
   );
+});
+
+self.addEventListener('message', function (event) {
+  if (event.data && event.data.type === 'SKIP_WAITING') {
+    self.skipWaiting();
+  }
 });
 
 self.addEventListener('activate', function (event) {
@@ -51,8 +68,16 @@ self.addEventListener('fetch', function (event) {
 
   if (event.request.mode === 'navigate') {
     event.respondWith(
-      caches.match('./index.html').then(function (cached) {
-        return cached || fetch('./index.html');
+      caches.match('./').then(function (cached) {
+        if (cached) return cached;
+        return fetch('./').then(function (response) {
+          // Never hand a redirected response back for a navigation request —
+          // Safari throws "Response served by service worker has redirections".
+          if (response && response.redirected) {
+            return fetch(response.url);
+          }
+          return response;
+        });
       })
     );
     return;
