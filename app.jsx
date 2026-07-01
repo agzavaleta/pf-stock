@@ -378,6 +378,65 @@ const Icon = ({ name, size = 16, color = "currentColor" }) => {
   );
 };
 
+// ─── Persistence (IndexedDB) ───────────────────────────────────────────────
+var PF_DB_NAME = "pf-stock-db";
+var PF_DB_VERSION = 1;
+var PF_STORE = "state";
+var PF_STATE_KEY = "app-state";
+var PF_SCHEMA_VERSION = 1;
+
+function pfIdbOpen() {
+  return new Promise(function (resolve, reject) {
+    if (!("indexedDB" in window)) { reject(new Error("IndexedDB unavailable")); return; }
+    var req = indexedDB.open(PF_DB_NAME, PF_DB_VERSION);
+    req.onupgradeneeded = function () {
+      var db = req.result;
+      if (!db.objectStoreNames.contains(PF_STORE)) db.createObjectStore(PF_STORE);
+    };
+    req.onsuccess = function () { resolve(req.result); };
+    req.onerror = function () { reject(req.error); };
+  });
+}
+
+function pfIdbGet(key) {
+  return pfIdbOpen().then(function (db) {
+    return new Promise(function (resolve, reject) {
+      var tx = db.transaction(PF_STORE, "readonly");
+      var req = tx.objectStore(PF_STORE).get(key);
+      req.onsuccess = function () { resolve(req.result); };
+      req.onerror = function () { reject(req.error); };
+    });
+  });
+}
+
+function pfIdbSet(key, value) {
+  return pfIdbOpen().then(function (db) {
+    return new Promise(function (resolve, reject) {
+      var tx = db.transaction(PF_STORE, "readwrite");
+      tx.objectStore(PF_STORE).put(value, key);
+      tx.oncomplete = function () { resolve(); };
+      tx.onerror = function () { reject(tx.error); };
+    });
+  });
+}
+
+// Migrates a persisted payload to the current schema. Add cases keyed off
+// data.schemaVersion here if PF_SCHEMA_VERSION is ever bumped; unknown or
+// missing fields fall back to safe defaults so a corrupt/partial record
+// never blocks app startup.
+function pfMigrate(data) {
+  if (!data || typeof data !== "object") return null;
+  return {
+    schemaVersion: PF_SCHEMA_VERSION,
+    inv: data.inv || {},
+    history: data.history || [],
+    audits: data.audits || [],
+    subfamilies: data.subfamilies || SUBFAMILIES_DATA,
+    plantsMeta: data.plantsMeta || PLANTS_META_DATA,
+    users: data.users || []
+  };
+}
+
 // ─── App ──────────────────────────────────────────────────────────────────────
 function App() {
   const [inv, setInv] = useState(INITIAL_INV);
@@ -410,6 +469,45 @@ function App() {
     const t = setInterval(() => setLastSaved(new Date()), 30000);
     return () => clearInterval(t);
   }, []);
+
+  // ─── Persistence: load once on mount, before any save can occur ───────────
+  const [hydrated, setHydrated] = useState(false);
+  const saveTimerRef = useRef(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    pfIdbGet(PF_STATE_KEY)
+      .then((raw) => {
+        if (cancelled) return;
+        const migrated = pfMigrate(raw);
+        if (migrated) {
+          setInv(migrated.inv);
+          setHistory(migrated.history);
+          setAudits(migrated.audits);
+          setSubfamilies(migrated.subfamilies);
+          setPlantsMeta(migrated.plantsMeta);
+          setUsers(migrated.users);
+        }
+      })
+      .catch((err) => {
+        console.warn("[PF Stock] persistence load failed, starting empty:", err);
+      })
+      .finally(() => { if (!cancelled) setHydrated(true); });
+    return () => { cancelled = true; };
+  }, []);
+
+  // ─── Persistence: debounced save after hydration, on relevant state change ─
+  useEffect(() => {
+    if (!hydrated) return;
+    if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+    saveTimerRef.current = setTimeout(() => {
+      pfIdbSet(PF_STATE_KEY, {
+        schemaVersion: PF_SCHEMA_VERSION,
+        inv, history, audits, subfamilies, plantsMeta, users
+      }).catch((err) => console.warn("[PF Stock] persistence save failed:", err));
+    }, 400);
+    return () => clearTimeout(saveTimerRef.current);
+  }, [hydrated, inv, history, audits, subfamilies, plantsMeta, users]);
 
   const showToast = useCallback((msg, type = "success") => {
     setAlert({ msg, type });
@@ -706,6 +804,14 @@ function App() {
   ];
 
   const pageProps = { inv, setInv, parts, totalVal, verifiedCount, diffCount, history, setHistory, audits, handleSaveAudit, handleDeleteAudit, handleUpdateAuditDate, handleDeleteHistory, navigate, showToast, handleVerify, handlePhysQty, handleUpload, handleGlobalUpload, resetData, plantSel, setPlantSel, sfSel, setSfSel, lastSaved, setLastSaved, subfamilies, setSubfamilies, plantsMeta, setPlantsMeta, users, setUsers };
+
+  if (!hydrated) {
+    return (
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: "100vh", fontFamily: "'Inter', system-ui, sans-serif", color: "#6b7280", fontSize: 14 }}>
+        Cargando datos…
+      </div>
+    );
+  }
 
   return (
     <div style={{ fontFamily: "'Inter', system-ui, sans-serif", minHeight: "100vh", background: "#f9fafb", display: "flex", flexDirection: "column", overflowX: "hidden" }}>
