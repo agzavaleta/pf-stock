@@ -917,7 +917,7 @@ function App() {
       )}
 
       {/* Single PageContent instance — never unmounts on resize */}
-      <main style={{ marginLeft: wide ? 220 : 0, flex: 1, width: wide ? "calc(100% - 220px)" : "100%", padding: wide ? "24px" : "12px 14px", paddingBottom: wide ? 0 : 72, overflow: "auto" }}>
+      <main style={{ marginLeft: wide ? 220 : 0, flex: 1, width: wide ? "calc(100% - 220px)" : "100%", boxSizing: "border-box", padding: wide ? "24px" : "12px 14px", paddingBottom: wide ? 0 : 72, overflow: "auto" }}>
         <PageContent page={page} {...pageProps} wide={wide} mid={mid} />
       </main>
 

@@ -25,7 +25,7 @@ try {
 // never appear for that release, even though the code did change.
 //
 // Rule: every deploy, no exceptions → increment BUILD_VERSION by 1.
-var BUILD_VERSION = 6;
+var BUILD_VERSION = 7;
 
 var SHELL_CACHE = 'pf-stock-shell-v' + BUILD_VERSION;
 var CDN_CACHE   = 'pf-stock-cdn-v' + BUILD_VERSION;
