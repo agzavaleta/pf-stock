@@ -1,8 +1,38 @@
-// PF Stock — Service Worker v0.9.0-beta
-// Shell: stale-while-revalidate | CDN: cache-first | Navigation: SPA fallback
+// PF Stock — Service Worker
+//
+// APP_VERSION (from version.js, imported below) is the public release
+// label shown in the UI — cosmetic/logging use only in this file.
+// BUILD_VERSION below is a SEPARATE, internal deploy counter: it is the
+// only thing that actually triggers the browser's update-detection, since
+// browsers detect updates purely by diffing this file's own bytes. Bumping
+// APP_VERSION does NOT bump BUILD_VERSION and vice versa — bump
+// BUILD_VERSION on every deploy regardless of whether the release label
+// changed.
+try {
+  importScripts('./version.js');
+} catch (e) {
+  // Non-fatal — APP_VERSION is only used for a cosmetic log line below.
+}
 
-var SHELL_CACHE = 'pf-stock-shell-v3';
-var CDN_CACHE   = 'pf-stock-cdn-v3';
+// Shell: stale-while-revalidate | CDN: cache-first | Navigation: SPA fallback
+//
+// ⚠️  BUILD_VERSION — READ BEFORE DEPLOYING ⚠️
+// The browser detects "a new version is available" ONLY by comparing this
+// file's own bytes to what it has cached — it never looks at app.jsx,
+// index.html, manifest.json, or any CSS. That means ANY change to ANY
+// deployed file (however small — a color, a placeholder, a width fix)
+// requires bumping BUILD_VERSION below, or the in-app update dialog will
+// never appear for that release, even though the code did change.
+//
+// Rule: every deploy, no exceptions → increment BUILD_VERSION by 1.
+var BUILD_VERSION = 6;
+
+var SHELL_CACHE = 'pf-stock-shell-v' + BUILD_VERSION;
+var CDN_CACHE   = 'pf-stock-cdn-v' + BUILD_VERSION;
+
+if (typeof APP_VERSION !== 'undefined') {
+  console.log('[PF Stock SW] release ' + APP_VERSION + ' / build ' + BUILD_VERSION);
+}
 
 var SHELL_ASSETS = [
   './',

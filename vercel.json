@@ -2,7 +2,7 @@
   "cleanUrls": true,
   "trailingSlash": false,
   "rewrites": [
-    { "source": "/((?!icons|manifest\\.json|service-worker\\.js|app\\.jsx).*)", "destination": "/index.html" }
+    { "source": "/((?!icons|manifest\\.json|service-worker\\.js|app\\.jsx|version\\.js).*)", "destination": "/index.html" }
   ],
   "headers": [
     {
@@ -10,6 +10,13 @@
       "headers": [
         { "key": "Cache-Control", "value": "no-cache, no-store, must-revalidate" },
         { "key": "Service-Worker-Allowed", "value": "/" }
+      ]
+    },
+    {
+      "source": "/version.js",
+      "headers": [
+        { "key": "Cache-Control", "value": "no-cache, must-revalidate" },
+        { "key": "Content-Type", "value": "application/javascript" }
       ]
     },
     {

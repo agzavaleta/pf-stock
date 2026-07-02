@@ -1,4 +1,9 @@
-var { useState, useEffect, useCallback, useRef, useMemo, Component } = window.React;
+var __ReactLib = (typeof window !== "undefined" && window.React) ? window.React
+  : (typeof React !== "undefined" ? React : null);
+if (!__ReactLib) {
+  throw new Error("[PF Stock] React is not available in this environment (neither window.React nor a global React was found).");
+}
+var { useState, useEffect, useCallback, useRef, useMemo, Component } = __ReactLib;
 class ErrorBoundary extends Component {
   constructor(props) { super(props); this.state = { error: null }; }
   static getDerivedStateFromError(e) { return { error: e }; }
@@ -379,19 +384,44 @@ const Icon = ({ name, size = 16, color = "currentColor" }) => {
 };
 
 // ─── Persistence (IndexedDB) ───────────────────────────────────────────────
+// Database: pf-stock-db | Store: app-state | Key: main
 var PF_DB_NAME = "pf-stock-db";
-var PF_DB_VERSION = 1;
-var PF_STORE = "state";
-var PF_STATE_KEY = "app-state";
+var PF_DB_VERSION = 2; // v2: store renamed "state"->"app-state", key renamed "app-state"->"main"
+var PF_STORE = "app-state";
+var PF_STATE_KEY = "main";
+var PF_STORE_LEGACY = "state";
+var PF_STATE_KEY_LEGACY = "app-state";
 var PF_SCHEMA_VERSION = 1;
 
 function pfIdbOpen() {
   return new Promise(function (resolve, reject) {
     if (!("indexedDB" in window)) { reject(new Error("IndexedDB unavailable")); return; }
     var req = indexedDB.open(PF_DB_NAME, PF_DB_VERSION);
-    req.onupgradeneeded = function () {
+    req.onupgradeneeded = function (event) {
       var db = req.result;
-      if (!db.objectStoreNames.contains(PF_STORE)) db.createObjectStore(PF_STORE);
+      var tx = req.transaction;
+
+      function ensureNewStore() {
+        if (!db.objectStoreNames.contains(PF_STORE)) db.createObjectStore(PF_STORE);
+      }
+
+      // Migrate any pre-existing record from the old store/key names so
+      // upgrading installs never lose already-persisted data.
+      if (event.oldVersion < 2 && db.objectStoreNames.contains(PF_STORE_LEGACY)) {
+        var legacyGet = tx.objectStore(PF_STORE_LEGACY).get(PF_STATE_KEY_LEGACY);
+        legacyGet.onsuccess = function () {
+          ensureNewStore();
+          if (legacyGet.result !== undefined) {
+            tx.objectStore(PF_STORE).put(legacyGet.result, PF_STATE_KEY);
+          }
+          if (db.objectStoreNames.contains(PF_STORE_LEGACY)) {
+            db.deleteObjectStore(PF_STORE_LEGACY);
+          }
+        };
+        legacyGet.onerror = function () { ensureNewStore(); };
+      } else {
+        ensureNewStore();
+      }
     };
     req.onsuccess = function () { resolve(req.result); };
     req.onerror = function () { reject(req.error); };
@@ -420,6 +450,28 @@ function pfIdbSet(key, value) {
   });
 }
 
+function pfIdbDelete(key) {
+  return pfIdbOpen().then(function (db) {
+    return new Promise(function (resolve, reject) {
+      var tx = db.transaction(PF_STORE, "readwrite");
+      tx.objectStore(PF_STORE).delete(key);
+      tx.oncomplete = function () { resolve(); };
+      tx.onerror = function () { reject(tx.error); };
+    });
+  });
+}
+
+// Public persistence API (IndexedDB only — no backend, no localStorage).
+function loadState() {
+  return pfIdbGet(PF_STATE_KEY);
+}
+function saveState(state) {
+  return pfIdbSet(PF_STATE_KEY, state);
+}
+function clearState() {
+  return pfIdbDelete(PF_STATE_KEY);
+}
+
 // Migrates a persisted payload to the current schema. Add cases keyed off
 // data.schemaVersion here if PF_SCHEMA_VERSION is ever bumped; unknown or
 // missing fields fall back to safe defaults so a corrupt/partial record
@@ -435,6 +487,19 @@ function pfMigrate(data) {
     plantsMeta: data.plantsMeta || PLANTS_META_DATA,
     users: data.users || []
   };
+}
+
+// Validates that a parsed backup JSON has the minimum required shape before
+// it's ever applied to app state. Used by Settings > Import Backup.
+function pfValidateBackup(data) {
+  if (!data || typeof data !== "object") return false;
+  if (typeof data.inv !== "object" || data.inv === null) return false;
+  if (!Array.isArray(data.history)) return false;
+  if (!Array.isArray(data.audits)) return false;
+  if (!Array.isArray(data.subfamilies)) return false;
+  if (typeof data.plantsMeta !== "object" || data.plantsMeta === null) return false;
+  if (!Array.isArray(data.users)) return false;
+  return true;
 }
 
 // ─── App ──────────────────────────────────────────────────────────────────────
@@ -476,7 +541,7 @@ function App() {
 
   useEffect(() => {
     let cancelled = false;
-    pfIdbGet(PF_STATE_KEY)
+    loadState()
       .then((raw) => {
         if (cancelled) return;
         const migrated = pfMigrate(raw);
@@ -501,7 +566,7 @@ function App() {
     if (!hydrated) return;
     if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
     saveTimerRef.current = setTimeout(() => {
-      pfIdbSet(PF_STATE_KEY, {
+      saveState({
         schemaVersion: PF_SCHEMA_VERSION,
         inv, history, audits, subfamilies, plantsMeta, users
       }).catch((err) => console.warn("[PF Stock] persistence save failed:", err));
@@ -820,7 +885,7 @@ function App() {
         <aside style={{ width: 220, background: "#fff", borderRight: "1px solid #e5e7eb", display: "flex", flexDirection: "column", position: "fixed", top: 0, left: 0, height: "100vh", zIndex: 20 }}>
           <div style={{ padding: "20px 16px 12px", borderBottom: "1px solid #e5e7eb" }}>
             <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-              <img src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' fill='%23102372'/%3E%3Cellipse cx='50' cy='50' rx='44' ry='35' fill='%23cc1518'/%3E%3Cellipse cx='50' cy='50' rx='34' ry='26' fill='white'/%3E%3Ctext x='50' y='61' font-family='Arial Black,sans-serif' font-size='34' font-weight='900' text-anchor='middle' fill='black'%3EPF%3C/text%3E%3C/svg%3E" alt="PF" style={{ width: 32, height: 32, borderRadius: 8, objectFit: "contain", background: "#102372" }} />
+              <img src="data:image/png;base64,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" alt="PF" style={{ width: 32, height: 32, borderRadius: 8, objectFit: "contain", background: "transparent" }} />
               <div>
                 <div style={{ color: "#111827", fontWeight: 700, fontSize: 14 }}>PF Stock</div>
                 <div style={{ color: "#6b7280", fontSize: 11 }}>Repuestos</div>
@@ -845,14 +910,14 @@ function App() {
       {!wide && (
         <header style={{ background: "#fff", borderBottom: "1px solid #e5e7eb", padding: "12px 16px", display: "flex", alignItems: "center", justifyContent: "space-between", position: "sticky", top: 0, zIndex: 20 }}>
           <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-            <img src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' fill='%23102372'/%3E%3Cellipse cx='50' cy='50' rx='44' ry='35' fill='%23cc1518'/%3E%3Cellipse cx='50' cy='50' rx='34' ry='26' fill='white'/%3E%3Ctext x='50' y='61' font-family='Arial Black,sans-serif' font-size='34' font-weight='900' text-anchor='middle' fill='black'%3EPF%3C/text%3E%3C/svg%3E" alt="PF" style={{ width: 28, height: 28, borderRadius: 6, objectFit: "contain", background: "#102372" }} />
+            <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAJgAAACYCAYAAAAYwiAhAAAfk0lEQVR42u2deZQcxZ3nPxGZWVcfUnfrap0WakmgVgtkCVoyyBaDjUGGWWwYY7yY9YzvtddjbA9vdp4v8ICP2YWZecb2mGWYHQPr8QxjCzAgToGwjMSNLAndAiS1pL7vqsrMiP0jK7Or+r4kWlJ836unVndVZmXEJ3/x+/3iF5FCa60xMjpBkqYJjAxgRgYwIyMDmJEBzMgAZmRkADMygBkZwIyMDGBGBjAjA5iRkQHMyABmZGQAMzKAGRnAjIwMYEYGMCMDmJGRAczIAGZkADMyMoAZGcCMjAxgRgYwIwOYkZEBzMgAZmQAMzIygBkZwIwMYEZGBjCjiS37jLlSrQtfAEKAlMG/RidE4rTbBLg3SEKAZQ3+GaUC0IyMBRsQKKV6YMqzSOHdo1ua0QcPwp49qH370EfqoLMT5XmIj32U2H+5CmFAMxYsgkqpgB670DopQL/9DvqPf0RvfQG99UXYtQuamyGVQr9nHiytQZ63HFG9BHnWWYjp0xG2bWg4owELoYJoyNOA9jz0rl3oLVvg2Wdh0/NwYH9guYqKYFUt4pIPIt6/BlFTgyidhPG4DGCDQqXqj6N+vxn9xBNYG59F7NgeDYVqyRK48krEunXI81cikqlCoJTqGU7zX0ZnEGBag+9DbtjSgK4/jnriCfT6hxDPPos8drSHmRUr4c+uRlxxBaJ6KQJ6oPL94HhhtGhgOoMBUyqAIWetlOfhP/00+v77kY8/jqyrQ+aA8+bORV99NeLaa7FqawsTep5nUhAGsP7B0oA6Woe6/374119ivf56BI8PqAsvhM/8BfKqq7DKyguhktJEgQawfnysHFj+rl2on/8Med/9yPr6HrCExF93GeIr/wP7ssvyhj8PhIHKANaffA+swMfydr2Jvv12uPd+rK5OpLBA+4HFWnc53HQT9gfWFvpVZvgzgPU/HPogAx/LqzuM+vH/Qt51F1ZnJ8JyQGmU9vDOvwDxve9grftIYMl6+WdGBrA+w6H2FcK20L6Pd+dP0Lf9AOfYMYSwIB5Hp7vwp05Ff+fbWF/6EtKyDVgGsGE68VKiAXfzZsQ3v4n1hz8Elimegkw3Phrv2o9j//jHWHPnBbGirwxYBrDh+VrKzeLdcgvyhz/C9jxw4oEPlU3jlpfBHbdj3fDpADrPi3JgRgawgZUDxdu5A/XZz2Fv3oyUduSgazeDu2oV8l/uwV58duC8h/kro9NCJ6Yn8zLx7q9/jX7fhTibNyOdeM+o6WbwPv1p7GeeCeDyvGA4NHAZwAaHK5g7VJaFe/PNyGuvxWlpRdixXHpB4HlZvO9+F/uee5CJROCjmSHRDJHDg0ugtMb7/Oex774bacd6JqylwPNc1B23E/vajQX5LK01Sim01ohh5reklAO+1/f93LF6Clj7XHx+3ZjWSCmRZ4gF1VoTdr0QYtht/u4BljuM8jy8667DeeABhBMHzw8iQtvCd7P4d9yO87UbEeGQOMYL830fy0SaE1b2uMGlNUorvI9/HPu3v0XEEuC6ubPYKDeD/61v9cAVVkrkLFY2m+WRR35Hc3ML8Xh84DtCBJ8pKytn1apVlJWVoZQqsDxKKTZseIy6ujoc26G/e0gIgWVbgMidP8OKFStZunTpiKzoqWq99u/bRyaTDWIqy6KqquqE3Kj2uMClfJRl493w33B6w2VZ4GbwPvEJnO9/v8dy5cFgWRZ33vkT/uZv/pqSklJUOKQOMTxWVs7kG9/4JjfccEM0vFqWxfr1v+VTn7qeZDJZMBT0BjUs6gkBf8975vP0089QUVFxWkOmtWbz5j/Q3NSElJJ4PM7cuXOj9hrP6x47YL6Ptm3c//nXOL+8txAuKcHLkj3nHKy7ftFT897PBezZs4dJkyZTXl6O53nDOnVrawtf/epXaG9v48tf/grZbBbLsnj77XdIJpNMmzYN13X7bbCAOV1g0draWmloaBgXwHpDPdFgTcTjJJNJpJTEYrETVuVrjxUubBvv/vtxfvijIA3hevkmAs92kP98N1ZxSfD+AcxwLBbD9308z8P3/QE7Jr/jHMdhypQp3Hrr3/K+913I8uXLo98rpfocazhWcbyGiYlu/cKgqr+bYWIAliuz8Xbvgi9+EWlZwdROaBWkRHtZ1I1fx1m1esjs/EAX6XleriE0UloRPOHwats22WyWe+/9ZQTYQMcaKEoMV7dls9kRATmYntv4LM0tzViWhRSStX9yMalU6rT378YHsNCp933UZz6L094OdiyolAiHRt/Dr6zE+va3gqFxFJZBa83kyZNJJpOAoLu7i4aGBhKJRASRUopYLMbevXvyP9mvRenu7qa7u7vfv2WzWWbPnk15efm4WKCjR49y7NgxbNtGSjnsYd8ABuArtG3h3/kT7Oefz6Uj8hpQSJR20V+/EbusbFRzi5Zl0dzczC23fJ+rr74G13XJZjPcdNNf8eijj1JcXFwQDHieP6B1kFLS1dVFbe0q1q5di1Kq4H1CCFzXZc2aNUydOnXA4/QOGAbLHzmOQywWiwAbLrBaa9Cg0QWgj+Tzw/2OExMwpcGS+MeOwXdvRkor8K3ywzMvi5o6FfkXnxlTqY3WmkQiQTKZxHEcSktL+cQnPslDDz3Up9EGS9JKKenu7qa2tpavfvUvR+w/hccdqLP6O2/Y0eFrKFC01sFiFSFAgEAMeY6Bvsdwv+PEBEwrkBbq7/6OWGNDUBWRb70sC5SHuvpqYuXlgzr2w3P1AnDChGpv6zMSp7u7uzvn+HtYlj0sHy2/Y44dPUZzcxOe52HbDiUlxUydNo1YLDbk+V3XxXM9lFZYUmLlWfT8czQ2NdHU2EgmnUEIQaooxdQpUykuKR7WNTY3N9NQX08mk0FaFqWlpcyYMQN7FFNxWms8z0PknA6t9bCudfSA6cCX8o/WIe++O+dr+X2cfw3Iq68eeI5mFHCMh6nPP07vYwkhBoSrvr6e5zc9z/GjR/GVCmxL7v3FJcVUVS1k+fLlODGn3+MqpXjk4d8hpQx8vTlzuOSDlxRM1bS2tvL8pk0cPnQYz/cReRu0xONxFiysYvXq1X06OPyO6XSaTc9t4uD+A7ieW3C9kyZP5vwLzqeqqmoEw7Tm0UcepaGhgVgsRnd3NxesqqW6unpk03kj9b0A1P/9V6yWFrCcQoiEAN/FnzYdef75E6r0Jrz7LMsiFotjWVbBS0pZ4LuEjdjY2MhD6x+k7sgRnFgMx3Giu1n5Pu1t7by4dStNTY2I3Jxqf+po76CtrY22tja6uroKot2Ojg4eWv8gBw8cxLIs7NwiGISIouY3Xn2Nxx59DM/z+pzD9302PLaBN3fuRFqSRCKBZVnR+xrq63nt1deG3U5CCHbv2cO+ffvIZrM0NTWRSCZZtGjRiIfakXreKM+DX94b3MW9M+5SggK9rAYxadIJ2bVmNDkbrTWO4/D222+xefNmfN8LfMfcXe55HvPmzWPevHkFDai1ZvPzvyedTpNMJslkMpRVlHPW/PnE4nFaW1s5cugwDQ0NQ36HZCpIajqOQyKRKLBwW154gZaWFoqLi0ln0lRUTKFqYRXZTIadO3biui4lpaW8dfAg27ZtY/ny5ZGVEVKyY8cO3n7rrSjwyWazVM6sZMaMStLpbvbt2z+s2ZH8gOeVl14mHosFAYoUXLTmouDmGmH7Dx+wnC+lXn4JuWM7SLsvYCHZixf3ADhGwJRS+L4fvUbjS/i+T0lJCY888gjr16/v06Ce51FeXs7DD/+OBQuqIn+vsbGRuro64vE4rusyafIkrrrqqoK5Utd12blzJ84AvklYpbHuio9QUlwS+GA56yKlpK2tjQMHDpBMJslmsxQVFXPFlVfkUjMwo7KSxx55FF/5xONx3ty5k5plNdiWDbnh982dO4nFYmityWQyLKmuZu3Fa6PvsGLlSvbv3z+swgAhBH/cto2mpiZSqRTd3d0sXLSQOXPmjCpQsEdgBoIOf+wxHB1UR9BPbkcDYs6ccbNWRUVFWJYVNXhd3ZFh3439WbH+nFTbtqmvr2fPnr0sWFAVzY82NzXjeR6O45BOp5k/fz7xeBzf9yP/xnEcli1bNmQGP5lMEk/EC24cIQSHDx0ik86QSqVIp9MsmT+fZDKJ53lIKZk3bx7lFeU0NTZh2zZtrW00NTYxbdo0AJqbm2lpbsG2bXzfJ5lKUbuqtuAcxcXFBd+x3/bJ/dvZ2cnrr70ezawkEglqV606CVFkbtGG2PR8YJ0GM5WTJ48LXPF4nOeee450OoPrZmlra+Wuu+6iqKho1JD1Z+IDy+hg204ASeRy+gXvz2bdfgOC4dzZ+bMP+Z/tPbxWTKmIItrwmJPLyqg/Xk8sFsPzPJqaegBrbGjAdd3AAmayzJo9K5q0Ds+TH0wM5Xq88sordHZ2UpQqoqOrgwsvvJDS0tJRpznsYVsvKVEdHYidb/ZMFQ3iq41VSilSqRT33Xcv99zzz9Hvi4uL+/gCWitKS0uHLBbsL1IMLZjWCi8XfYVDfSo3GRwGCHv37qF6aTUVFRUFoIyk4Xvnw9rb26NzSCkpKiqK/h52anFRccH1drR3RD+3trX1zGpoRVluO4Xh5N4KAiAnRktLCzt37CCRSJDJZpg6bRo1y5aNKYc2fMCEgEOHkMeODx18dnWO6xBZXFzcJy+Wn/HPZLLU1tbmd2O/HZtOp0mn0/2cR5FIJJk9e3ZBh0ydNo1UUYpsJouUEjfr8sjDv+PSyz7M9OnTx9Tw4efS6XQBCI7j9Hlv7/q4dLpnuqu7q3DqK1WUGt33kYIXX3wRL+tiJ22UUqxevTp3840+3TR8wACO1oHvBumJwSzY0WPjGjUOVPpi2zadnZ1UVlZy3XWf7DP85CdQOzs7Wbv2YtatW4fvF1of182yePHZUbFh6IQnEglqli3j95uep6ioCNu26erq4sH1D7J69WqW1iwdU5Y8SmTmWStrAAvbc+sIXNcrCDLyzz3SRGhonQ8cOMD+fftJJJOk02mqFi1k7ty5Y54BGFFIppuaoiTjQJ6iAPS+vYVR5RjUU03Rt2FaW1tJpZLcccc/UFlZSTab7beBpZSk02nOPfdcrr/+U8MewrTWLF++nMb6Bt58801SqVSQl/IVz27cyJG6I6xduzaK4EbaEUoplK8GnaYKv/9AqZre1R+WtEZsST3f56UXX0LkvlM8Hqd21apxKeMZkQUT6czghWm5FUVi23a07yEsO4wrR229Jk2aFJW59Ax/QUS4ZEk1X/7yV1i2bNmA1qtwiOzOpTu8vHBd5PwfEeXGenf2JR/6IIlkkm1vvIHjOFFUu/vNXXS2d3D5R9ZFFR4j9ccKJt0HGN4LOlowKJAjhUJrjW1ZVFRU0NLcHJU/1R8/zqScc3/y5iKHymkpBUIi9uxB7d6Ndc6SYHJcjhywsJri5ptv4ZprrsHzCnM4tm1H1iqEa6jIUoiwoFD3Oxc58GVL1rx/DTNmVvL8s8+RyWRwHIdUKsXhw4d5+qmnuHzdutFNXcnCHbGVVgNGoPl5tZ52kr0mW0Zez6aUYsWKFdQdOUImE8yBvvCHF5gzZ86orfPIporCzHZREUPybDtIz0Vt2DB0tDmMuyuZTJJMpigpKSGVSkWvME8zlOUaT19wYVUVV33so5SVl+G6LlprUqkU+/ftZ/fu3dG840gAsyw76sD8KtPCNEphvjE/EOjthGez2RFD7rouZWVlVNcsJZPJEIvFaG1p4dVXXhnz/O+IekZMnTo0NDqYDNb33R/cjWPs/HB9YzgHl/8K5xBPhkJ4ysrKuOLKKykpLY38H8uy2LN7z4hSFiEU+SmX8Dp7K5PJFPw/kZewjccTBX/rHVUO99qybpalNTWUTirFdV0SiQTb3ggy+oPNsY6rBWPWTHQyFVSuDtSQvgLLRr70Emrjxv4rLkY6jAzwOtkKh+GioiJWnr8ygiGMUkdTSpTvu2mtyaQzffyrrq7uguMWFRX3m5YQQtDW2jpi30wIge/7xGMxapYtw3XdIC3jurzwhxdOggULI6vKSvScOblwUQyWVAmcu1tv43R4Tk3vVdBKKcrLygsqFgaDPn/Veu/jlZSUFPy+vb2tT2qmra0tSsbats3kvJmSSZMmFfytobExAr+/gsehoufq6moml5VFVuxgLn0xWis2fMB8H2E76OXnBqHMYEOT74PlIJ56Cu/hh4LM/jgtpjiZ6urqIpvNFsATzga0d7RHc5JKKZLJZEEniFz7hDVgHR0d/VrgKVOmRD9LKamrqyt4T0dHB02NjdFcY6ooRXlFz+bHFRUVJBKJaCK7taWFA/v39zlXe3v7oOsCRF4e7bzzzo3ya5ZlsWXLC7jhUsQT5oPlSnq55BLUMO2SFAJ94zfwOzty2YV3256NzD86fvw4//5vv2bHjh10tLdHS+Hq6urYumULlmVFw8vMmZUFEV88Hu+BDXjt1VdJd3fjui5HjhyJ/LeZs2aSSCbxfZ9YLMahdw6xe/dutNZ0d3ez+febo/We2WyWWbNmRZFdONMxbfr0KGFr2zabf7+ZgwcPks1kaGtrY+vWrTzyu0eGFYBorTn77LOZMmVKLq/o0NTQxOuvvTYqKzaiyW4AeemlqGQKmU4HOzwPdEKlEJaDs3cP7k03Yd350yEXf+QX/oXly6N1LsNjha9gOBtZRCuFpLmpmec2PksikSCVSqGUor29PcqAZzIZSkpKOPuccwqGmunTp7Nv714SiQRODpwH/uOBCMhrP3ldzp8qYtGiRbzy8svRcLnx6Wd49eVXcF2Xzs5OEolEUKbtOJx73nl9vue5557LwYMHomEym82y4dHHKCoqwvM8Ojs6mTR5UkFAFFri3mXiWmss22b5e5fz5BNPAjESyQRvvPEGixYvHvHEtxwRYEoh570HvfYDgAJLDhUCIuwY9k9/hvurXwVwDWCmhRC0tLTQ2dlJR0cHHR0dtLe3R2U6I3PGg2OFx+ns7KS1tTUq9Bsus7F4DCcWRHnp7m4aGxtpaWkJVv1oTWdnJ8lkkg9deilFRUUFOaol1UuYPmMGHR0dUelNZ2cnTU1NKKWjRR1aay6ovYD5Z82P3gvQ3NQUDatdXV34vs8H1n6gYNV5aFFmz5lNbe0quru7yWQy0ffo6Oigu7s7qExJJAqgyGQydHd1RUv58n1JrTVVCxcyddpUWltbyWaztLa0svHpZ0a8bnRku+uEOxb+5jfIj30MOdScZOi/CfAScfTGjTgrVxZYsjCPtX37dm655WbS6W6ktMhmMyxevJibb/5+NNk93FU1R44c5tvf/hZNTU1Ylk0mk6a8vIJbb72N2bNnj+gOPH78OG/u2El9fT3pTBrfVwgByWSKWbNmUbNsGcXFRf0eM51O89qrr3LonUN0p9OQszAzZ81izfvXRBY69ON2bN/OgQMHaG/vwM89rSQejzNlyhSql1YPOMEe/u7AgQPs2L6d1pbW3MIUm+KSEmbNmsXisxdH7ai1Ztu2baRz0all29QsqylImQghOHr0KAf2HwjyblrjK0XNshpSqdQJAix3+2vXxVv+XpydO0A6PQtuB7F+2vfwZs1EPrsRa0HVKbkPa9bNovwgFZFf4TAcYDPZDFppnJgz5Hyh53mRTxWLxQpKuAdd9pb7m+u6kdPfX3XGSfV6RwxYrnQ6e999WNdfjxXuXDi0U4T2smSrqrAe34A9/6w+liyMpPLD9tHkvPpbixjmqEZzrIGsp1bB7P5gnT5QTmqgtYuD5bCGY8F7vy+/Lfr7fX6Ob7D0zGDvG1/Acg681hr3wouIbXkh2DZgGJBpywIvizd/PuKhh7Crq085SzaWebmRfHY8dveZCHtgyFF+e4RlIf/+Dnwph068hjSHTv+BA+iLL8Z96skArvCRe6eAxtJpo6l8fTe+57sPWC5xaq1ahf+Nb6A8d/hl0jnInPp6xOXrcH96JyrcSvMUTMYanYghMoz1lUL5Ht5Fa3BefLFnJ+nhpj20Qikf74ZPYf39P2CVlQUPbpCWedDVGQ9YzhdDSvx9e1G1q3CamgM4hluyklv5rb0s3qKF8I//iPPhy3pSIpaNecD2qa2x1brkKiWsBVXw/+7Hk7ltMsQwD5t7YIOw49i79yAuuxz3i1/AO3o08M0EZtgc/yglGCVOks879mIqK1iA63zoUvS/3BMUxwlGNsT5HsJysKWD/U+/QK9Ygfvzn6HcnG8XPjnEaIxg5cqsLBstwj1zJjpgEE0B2dd/CvXzn+P7bgDZSHImSgXFinYc58gRrC/9d/zVq3Ef+A+UED1BxCkUcU4YsMJnmFsWys2SufVvcZ96ChBjqjg+eYDlIBOeh/2FL6DuvjuoDR/N3mC+B9JG2jGcl19GXvNn+BddhPefD6CV3/PwBs874Y1z6kKVuxFDi2Xb+B0duP/nLrwFC+DJp7CX1eTWUIgTDfg4y3W11lpnf/OfOltUFOwB48S1FtbIX5YTvED7oLMrVujML36h3eYmrcLzKaW162nt+/qMl+9H7a+11kpr7b71ls7edqt2FyzQLujMf/2k9vPb7gSLE3LU3EW6W7fo7IIFWoWQSXt8QJszR2f+6pvae+1Vrfpr4DMFNqV6rjkPFt/3tbvxGZ358z/XbsUUrUB7oDM/uC2AS6mTApfWWp+450XmpoD8Y8fwPvdZnIceDh72Ppbq1vAhDl42WOJl2eg1F6Gu/XjwbO+5c3uyGvlO7en0APnwEdNaF0yxacDfvh394HrEvz+AePWVwA0GvMpK9D/9HPvKP0XkPYBs4ufBhvSncnuKAd6Pfoj8znexs9lgX9exOOuh0+96aHwUoEtKUWsuQlx5BfKSDyIXLixMoSnV43Pkvya6g55LaEcRe953Vr6PfuN11OOPox9+GLllK5br5lbfWyjt4132YeRPf4o1/6yCZ0SdGonW4d5xgJYSf+sW1Ff/EmvLFixEbpJ8DPvHR1t0CvAyPXdyIolefh5cfDGs/QBy+XsRU6b0jWh8Fa1Gf1fBC0EKX6G17hWFK0C/8w76xRfRzzyF2LgJ+cftCHL7xkobnBhkunBLStA3fw/nxq8HfxvjZswTF7BeQ6ZyXbzb/zfyBz/Eam1FhI9YHmueK38/WM8l3GleA2rKVNSyGli1CnnB+YilNYi5cxGO0/9EQWg1eu8/S6/83lAg5n8+/Ln3Mfvp9PAduqsLvX9/YKVe2ILYshWxYweyo73nZhEWOE7wzM1MNwpQf3ol4oc/wj7nnB5o36W9ck8eYKE1y12ov3cP6ns3I++7DwuCHXvGa8I73+9SKtgRKLQAAPEEet5cWLwYqqvhnHMQVVUwZw5i6hRIJINc8UnIJmiAzg708ePot96C3Xtgxw7Yvh327EW88w5C+YXfx44Vwu1mAjekuhrxve9hX3NN8N4JUAp1cgHLtw65nZS9555D33Yb1oYNAWihRettQcYLOK0jC5ff0QrQqSL01KkwYwZ65kyYNRMqK5HTpqErKpBlZeiSEihKBY+CjsXBsdH5k/NaI3wPPB+dzUB3Gjo7oa0N1dKCaGhAHT8OR47A4cOIw0fg6FFEQwMyk+4LdhgYCREM50r3DONeFgX48+ahb/wa1ue/gJVM5j1h+N3f4fvkA9Y7GsoFAf7jG+D2OxAbNuSWOonAnwid83G96l7+Vgi98vtMn+j+hi/LDoYlx0FbNtqSeVhohK8Ch9p1g5fqeZhB+K5+tsgLjhtC0dsvC28SrdG+G/ia88+CL30B67OfQ5aVFQRWE0XvHmD5kWZYVQF4mzbBz36GXL8e2dUVdEQ4fI6nVRsKvN4+Vn5nK5U/wA12QKJFyv0FEL0d+97Xlm953Sw651f6K1agP/c57E9ehywp7WnHCZiOefcBKwBNghRBI+7Zjb73XvjVr7F27+pxau1YoQV8V1pthJ04ku+ZD5Xngg6WOfslpah1lyM//WnkpZf21MZPULAmHmD5oIU5H8BPd6OefBJ+9W+IJx5HHq/vgc1yomHjXQVuTD1AdGMFJrwnAvZtG11bi77mauRHP4o17z09Q+sEB2viAtY7MRo+PB7QDfWop55GP/gg4tnnEIcPke/9YMVyHdVPXmnCtLjI86fI1Wb5UZSrUin0ypWIdesQ69Yha2oKoYJcxe8pcv9MWMB6R515Vk0Dqq0NtXUr+sknEZueQ27bjmhv6xWFyVzhohg4oXkih9Defpfvg/IKUxTCQlWdha5dBR+8BPH+NUHWPf/6Q2s1QZ77dHoBNgRsUX7r0CH0a6/Cli3ol16GnTuRhw4jczMFfW54YRU636Pxmfr7XBT1qj7RpwJUeTksqEKcdy6sqkWsXIk4+2xELH7aQHXqAtZfZ4YPPBW99jrt6kK/9RZ61y70zh3w5i7E/v1w6DCioQHR0V6QMhjLiJMfT2oAJ44uL0NXzkDPnQuLFsGSJYhzzkYuWICcOq3v+cK52dMAqtMDsD4+mw4SkQN0UgRBJo1uaITjx+HYMfSxY3D8OLqhAdnSgm5rQ3d2IrrTiGw25/eEaw1EkPuKx6EohSgpQU+aBOUVMG0KTJuOmDEdpk8PZgRKJ/cPb+h7hcnQU2Hi/YwHrD8L11+ichgdWbhhet+gb0Qbs+dXjZxupUNnNGBDgdf75/4c9IH8rOizFCI4kHN/BuvMA8zopEqaJjAygBkZwIyMDGBGBjAjA5iRkQHMyABmZAAzMjKAGRnAjAxgRkYGMCMDmJGRAczIAGZkADMyMoAZGcCMDGBGRgYwIwOYkQHMyMgAZmQAMzIygBkZwIwMYEZGBjAjA5iRAczIyABmZAAzMoAZGRnAjCa2/j/OtXB3ytuXYgAAAABJRU5ErkJggg==" alt="PF" style={{ width: 28, height: 28, borderRadius: 6, objectFit: "contain", background: "transparent" }} />
             <span style={{ color: "#111827", fontWeight: 700, fontSize: 14 }}>PF Stock</span>
           </div>
         </header>
       )}
 
       {/* Single PageContent instance — never unmounts on resize */}
-      <main style={{ marginLeft: wide ? 220 : 0, flex: 1, padding: wide ? "24px" : "12px 14px", paddingBottom: wide ? 0 : 72, overflow: "auto" }}>
+      <main style={{ marginLeft: wide ? 220 : 0, flex: 1, width: wide ? "calc(100% - 220px)" : "100%", padding: wide ? "24px" : "12px 14px", paddingBottom: wide ? 0 : 72, overflow: "auto" }}>
         <PageContent page={page} {...pageProps} wide={wide} mid={mid} />
       </main>
 
@@ -2768,6 +2833,36 @@ const PLANT_COLORS = [
   { color: "#b91c1c", bg: "#fef2f2", label: "Rojo" },
   { color: "#7c3aed", bg: "#f5f3ff", label: "Púrpura" },
   { color: "#0f766e", bg: "#f0fdfa", label: "Teal" },
+  { color: "#1e3a8a", bg: "#eff6ff", label: "Marino" },
+  { color: "#4f46e5", bg: "#eef2ff", label: "Índigo" },
+  { color: "#059669", bg: "#ecfdf5", label: "Esmeralda" },
+  { color: "#ea580c", bg: "#fff7ed", label: "Coral" },
+  { color: "#be185d", bg: "#fdf2f8", label: "Fucsia" },
+  { color: "#86198f", bg: "#fdf4ff", label: "Ciruela" },
+  { color: "#06b6d4", bg: "#ecfeff", label: "Turquesa" },
+  { color: "#451a03", bg: "#fffbeb", label: "Café" },
+  { color: "#475569", bg: "#f8fafc", label: "Gris" },
+  { color: "#1e293b", bg: "#f1f5f9", label: "Pizarra" },
+  { color: "#ca8a04", bg: "#fefce8", label: "Amarillo" },
+  { color: "#84cc16", bg: "#f7fee7", label: "Chartreuse" },
+  { color: "#22c55e", bg: "#f0fdf4", label: "Verde primavera" },
+  { color: "#5eead4", bg: "#f0fdfa", label: "Menta" },
+  { color: "#38bdf8", bg: "#f0f9ff", label: "Celeste" },
+  { color: "#64748b", bg: "#f8fafc", label: "Acero" },
+  { color: "#94a3b8", bg: "#f8fafc", label: "Perla" },
+  { color: "#0f172a", bg: "#f1f5f9", label: "Carbón" },
+  { color: "#a78bfa", bg: "#f5f3ff", label: "Lavanda" },
+  { color: "#c026d3", bg: "#fdf4ff", label: "Orquídea" },
+  { color: "#f472b6", bg: "#fdf2f8", label: "Rosa" },
+  { color: "#831843", bg: "#fdf2f8", label: "Vino" },
+  { color: "#7f1d1d", bg: "#fef2f2", label: "Granate" },
+  { color: "#dc2626", bg: "#fef2f2", label: "Bermellón" },
+  { color: "#57534e", bg: "#fafaf9", label: "Tierra" },
+  { color: "#fdba74", bg: "#fff7ed", label: "Melón" },
+  { color: "#334155", bg: "#f8fafc", label: "Grafito" },
+  { color: "#78716c", bg: "#fafaf9", label: "Musgo" },
+  { color: "#2dd4bf", bg: "#f0fdfa", label: "Aguamarina" },
+  { color: "#713f12", bg: "#fffbeb", label: "Sepia" },
 ];
 
 function PlantsCrudPage({ plantsMeta, setPlantsMeta, navigate, showToast, wide, inv, setInv, setHistory, setAudits, setSubfamilies }) {
@@ -2868,7 +2963,7 @@ function PlantsCrudPage({ plantsMeta, setPlantsMeta, navigate, showToast, wide, 
   if (editCode !== null) {
     const isNew = editCode === "";
     return (
-      <div style={{ maxWidth: "min(560px, 100%)" }}>
+      <div style={{ width: "100%", maxWidth: "min(100%, 1040px)" }}>
         {leaveConfirm && <ConfirmDialog title="Cambios sin guardar" message="Tienes cambios sin guardar. Si sales, se perderán los datos. ¿Deseas salir?" confirmLabel="Salir sin guardar" cancelLabel="Cancelar" danger onConfirm={() => { setLeaveConfirm(null); leaveConfirm(); }} onCancel={() => setLeaveConfirm(null)} />}
         <Breadcrumb items={[
           { label: "Ajustes", onClick: () => guardedExitPlant(() => { setEditCode(null); navigate("settings"); }) },
@@ -2924,7 +3019,7 @@ function PlantsCrudPage({ plantsMeta, setPlantsMeta, navigate, showToast, wide, 
             </div>
           </div>
 
-          <div style={{ display: "flex", gap: 10, justifyContent: "flex-end" }}>
+          <div style={{ display: "flex", gap: 10, justifyContent: "flex-end", flexWrap: "wrap" }}>
             <button onClick={() => guardedExitPlant(() => { setEditCode(null); setFormErr({}); })} style={S.btn()}>Cancelar</button>
             <button onClick={handleSave} style={{ ...S.btn("primary"), background: "#2563eb" }}>
               <Icon name="save" size={13} color="#fff" /> {isNew ? "Crear" : "Guardar cambios"}
@@ -3129,7 +3224,7 @@ function SubfamiliesCrudPage({ subfamilies, setSubfamilies, navigate, showToast,
   if (editItem !== null) {
     const isNew = !editItem.code;
     return (
-      <div style={{ maxWidth: "min(560px, 100%)" }}>
+      <div style={{ width: "100%", maxWidth: "min(100%, 1040px)" }}>
         {leaveConfirm && <ConfirmDialog title="Cambios sin guardar" message="Tienes cambios sin guardar. Si sales, se perderán los datos. ¿Deseas salir?" confirmLabel="Salir sin guardar" cancelLabel="Cancelar" danger onConfirm={() => { setLeaveConfirm(null); leaveConfirm(); }} onCancel={() => setLeaveConfirm(null)} />}
         <Breadcrumb items={[
           { label: "Ajustes", onClick: () => guardedExitSf(() => { setEditItem(null); navigate("settings"); }) },
@@ -3195,7 +3290,7 @@ function SubfamiliesCrudPage({ subfamilies, setSubfamilies, navigate, showToast,
             </div>
           </div>
 
-          <div style={{ display: "flex", gap: 10, justifyContent: "flex-end" }}>
+          <div style={{ display: "flex", gap: 10, justifyContent: "flex-end", flexWrap: "wrap" }}>
             <button onClick={() => guardedExitSf(() => { setEditItem(null); setFormErr({}); })} style={S.btn()}>Cancelar</button>
             <button onClick={handleSave} style={{ ...S.btn("primary"), background: "#2563eb" }}>
               <Icon name="save" size={13} color="#fff" /> {isNew ? "Crear" : "Guardar cambios"}
@@ -3392,7 +3487,7 @@ function UsersCrudPage({ users, setUsers, navigate, showToast, wide }) {
     const isNew = editId === "new";
     const preview = formNombre.trim() && formApellido.trim() ? `${formNombre.trim()} ${formApellido.trim()}` : null;
     return (
-      <div style={{ maxWidth: "min(560px, 100%)" }}>
+      <div style={{ width: "100%", maxWidth: "min(100%, 1040px)" }}>
         {leaveConfirm && <ConfirmDialog title="Cambios sin guardar" message="Tienes cambios sin guardar. Si sales, se perderán los datos. ¿Deseas salir?" confirmLabel="Salir sin guardar" cancelLabel="Cancelar" danger onConfirm={() => { setLeaveConfirm(null); leaveConfirm(); }} onCancel={() => setLeaveConfirm(null)} />}
         <Breadcrumb items={[
           { label: "Ajustes", onClick: () => guardedExitUser(() => { setEditId(null); navigate("settings"); }) },
@@ -3407,7 +3502,7 @@ function UsersCrudPage({ users, setUsers, navigate, showToast, wide }) {
           <div style={{ marginBottom: 14 }}>
             <label style={{ fontSize: 12, fontWeight: 600, color: "#374151", display: "block", marginBottom: 5 }}>Nombre</label>
             <input value={formNombre} onChange={e => { setFormNombre(e.target.value); setFormErr(f => ({ ...f, nombre: undefined })); }}
-              placeholder="Antonio"
+              placeholder="Escriba"
               style={{ ...S.input, width: "100%", border: `1px solid ${formErr.nombre ? "#dc2626" : "#d1d5db"}`, boxSizing: "border-box" }} />
             {formErr.nombre && <div style={{ fontSize: 11, color: "#b91c1c", marginTop: 3 }}>{formErr.nombre}</div>}
           </div>
@@ -3415,7 +3510,7 @@ function UsersCrudPage({ users, setUsers, navigate, showToast, wide }) {
           <div style={{ marginBottom: 14 }}>
             <label style={{ fontSize: 12, fontWeight: 600, color: "#374151", display: "block", marginBottom: 5 }}>Apellido</label>
             <input value={formApellido} onChange={e => { setFormApellido(e.target.value); setFormErr(f => ({ ...f, apellido: undefined })); }}
-              placeholder="Medina"
+              placeholder="Escriba"
               style={{ ...S.input, width: "100%", border: `1px solid ${formErr.apellido ? "#dc2626" : "#d1d5db"}`, boxSizing: "border-box" }} />
             {formErr.apellido && <div style={{ fontSize: 11, color: "#b91c1c", marginTop: 3 }}>{formErr.apellido}</div>}
           </div>
@@ -3426,7 +3521,7 @@ function UsersCrudPage({ users, setUsers, navigate, showToast, wide }) {
             </div>
           )}
 
-          <div style={{ display: "flex", gap: 10, justifyContent: "flex-end" }}>
+          <div style={{ display: "flex", gap: 10, justifyContent: "flex-end", flexWrap: "wrap" }}>
             <button onClick={() => guardedExitUser(() => { setEditId(null); setFormErr({}); })} style={S.btn()}>Cancelar</button>
             <button onClick={handleSave} style={{ ...S.btn("primary"), background: "#2563eb" }}>
               <Icon name="save" size={13} color="#fff" /> {isNew ? "Crear" : "Guardar cambios"}
@@ -3587,9 +3682,104 @@ function RolesCrudPage({ users, setUsers, navigate, wide }) {
   );
 }
 
-function SettingsPage({ lastSaved, setLastSaved, showToast, navigate, subfamilies, plantsMeta, users }) {
+function SettingsPage({ lastSaved, setLastSaved, showToast, navigate, subfamilies, plantsMeta, users, inv, history, audits, setInv, setHistory, setAudits, setSubfamilies, setPlantsMeta, setUsers }) {
+  const [importPending, setImportPending] = useState(null);
+  const [confirmClear, setConfirmClear] = useState(false);
+  const fileInputRef = useRef(null);
+
+  function pad2(n) { return String(n).padStart(2, "0"); }
+
+  function handleExportBackup() {
+    const now = new Date();
+    const filename = `PFStock_Backup_${now.getFullYear()}-${pad2(now.getMonth() + 1)}-${pad2(now.getDate())}_${pad2(now.getHours())}-${pad2(now.getMinutes())}.json`;
+    const payload = { schemaVersion: PF_SCHEMA_VERSION, exportedAt: now.toISOString(), inv, history, audits, subfamilies, plantsMeta, users };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    showToast("Respaldo exportado");
+  }
+
+  function handleFileSelected(e) {
+    const file = e.target.files && e.target.files[0];
+    if (fileInputRef.current) fileInputRef.current.value = "";
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      let parsed;
+      try {
+        parsed = JSON.parse(reader.result);
+      } catch (err) {
+        showToast("El archivo no es un respaldo válido (JSON inválido)", "error");
+        return;
+      }
+      if (!pfValidateBackup(parsed)) {
+        showToast("El archivo no tiene la estructura esperada de un respaldo de PF Stock", "error");
+        return;
+      }
+      setImportPending(parsed);
+    };
+    reader.onerror = () => showToast("No se pudo leer el archivo", "error");
+    reader.readAsText(file);
+  }
+
+  function applyImport() {
+    const data = importPending;
+    if (!data) return;
+    setInv(data.inv || {});
+    setHistory(data.history || []);
+    setAudits(data.audits || []);
+    setSubfamilies(data.subfamilies || SUBFAMILIES_DATA);
+    setPlantsMeta(data.plantsMeta || PLANTS_META_DATA);
+    setUsers(data.users || []);
+    setImportPending(null);
+    showToast("Respaldo restaurado");
+  }
+
+  function handleClearLocalData() {
+    clearState()
+      .catch((err) => console.warn("[PF Stock] clearState failed:", err))
+      .finally(() => {
+        setInv(INITIAL_INV);
+        setHistory([]);
+        setAudits([]);
+        setSubfamilies(SUBFAMILIES_DATA);
+        setPlantsMeta(PLANTS_META_DATA);
+        setUsers([]);
+        setConfirmClear(false);
+        showToast("Datos locales eliminados");
+      });
+  }
+
   return (
     <div style={{ maxWidth: "100%" }}>
+      {importPending && (
+        <ConfirmDialog
+          title="Restaurar respaldo"
+          message="Esto reemplazará todos los datos actuales (inventario, auditorías, historial, subfamilias, plantas y usuarios) con el contenido del respaldo seleccionado. Esta acción no se puede deshacer."
+          confirmLabel="Reemplazar datos"
+          cancelLabel="Cancelar"
+          danger
+          onConfirm={applyImport}
+          onCancel={() => setImportPending(null)}
+        />
+      )}
+      {confirmClear && (
+        <ConfirmDialog
+          title="Eliminar datos locales"
+          message="Esto eliminará todos los datos guardados en este dispositivo (inventario, auditorías, historial, subfamilias, plantas y usuarios) y no se puede deshacer. Exporta un respaldo antes si lo necesitas."
+          confirmLabel="Eliminar todo"
+          cancelLabel="Cancelar"
+          danger
+          onConfirm={handleClearLocalData}
+          onCancel={() => setConfirmClear(false)}
+        />
+      )}
       <PageHeader title="Ajustes" subtitle="Gestión del sistema" />
       <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
 
@@ -3649,8 +3839,27 @@ function SettingsPage({ lastSaved, setLastSaved, showToast, navigate, subfamilie
         </button>
 
         <div style={S.card}>
+          <div style={{ fontWeight: 600, fontSize: 14, marginBottom: 8 }}>Respaldo y datos</div>
+          <p style={{ fontSize: 13, color: "#6b7280", marginBottom: 12 }}>
+            Los datos se almacenan localmente en este dispositivo. Si se borran los datos de Safari, se elimina la app o el dispositivo se restablece, la información podría perderse. Exporta respaldos periódicamente.
+          </p>
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            <button onClick={handleExportBackup} style={{ ...S.btn("primary"), width: "100%", justifyContent: "center" }}>
+              <Icon name="file" size={14} color="#fff" /> Exportar respaldo
+            </button>
+            <input ref={fileInputRef} type="file" accept="application/json,.json" onChange={handleFileSelected} style={{ display: "none" }} />
+            <button onClick={() => fileInputRef.current && fileInputRef.current.click()} style={{ ...S.btn(), width: "100%", justifyContent: "center" }}>
+              <Icon name="upload" size={14} color="#374151" /> Importar respaldo
+            </button>
+            <button onClick={() => setConfirmClear(true)} style={{ ...S.btn("danger"), width: "100%", justifyContent: "center" }}>
+              <Icon name="trash" size={14} color="#dc2626" /> Borrar datos locales
+            </button>
+          </div>
+        </div>
+
+        <div style={S.card}>
           <div style={{ fontWeight: 600, fontSize: 14, marginBottom: 8 }}>Guardado</div>
-          <p style={{ fontSize: 13, color: "#6b7280", marginBottom: 12 }}>El guardado automático ocurre cada 30 segundos. Los datos persisten en memoria durante la sesión activa.</p>
+          <p style={{ fontSize: 13, color: "#6b7280", marginBottom: 12 }}>Los cambios se guardan automáticamente en este dispositivo. La hora mostrada abajo es una referencia visual del último guardado.</p>
           <button onClick={() => { setLastSaved(new Date()); showToast("Datos guardados"); }} style={{ ...S.btn("primary"), width: "100%", justifyContent: "center" }}>
             <Icon name="save" size={14} color="#fff" /> Guardar ahora
           </button>
@@ -3658,7 +3867,7 @@ function SettingsPage({ lastSaved, setLastSaved, showToast, navigate, subfamilie
 
         <div style={S.card}>
           <div style={{ fontWeight: 600, fontSize: 14, marginBottom: 8 }}>Acerca de</div>
-          {[["Versión", "1.0.0"], ["Plantas", Object.keys(plantsMeta).length], ["Subfamilias", fmtN(subfamilies.length)], ["Desarrollado por", "María Andrea Vergara"]].map(([l, v]) => (
+          {[["Versión", (typeof window !== "undefined" && window.APP_VERSION) || "1.0.0"], ["Plantas", Object.keys(plantsMeta).length], ["Subfamilias", fmtN(subfamilies.length)], ["Desarrollado por", "María Andrea Vergara"]].map(([l, v]) => (
             <div key={l} style={{ display: "flex", justifyContent: "space-between", padding: "6px 0", fontSize: 13 }}>
               <span style={{ color: "#6b7280" }}>{l}</span><span style={{ fontWeight: 500 }}>{v}</span>
             </div>
