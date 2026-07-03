@@ -1,6 +1,8 @@
 # CHANGELOG.md — PF Stock
 
-## v1.0.1 (current)
+## v1.0.1 (current — pending manual version bump)
+**Note:** `app.jsx` in this release reflects all changes below. `version.js` (`APP_VERSION`) and `service-worker.js` (`BUILD_VERSION`) were **not** part of this session's uploads, so they could not be edited directly — see PROJECT_RULES.md's "Manual steps before deploy" for the exact bumps required before shipping this release.
+
 ### Claude Artifact Preview (new)
 - Introduced `app-preview.jsx`: a Claude-preview-only derivative of `app.jsx`, converted to ESM (`import ... from "react"` / `export default AppRoot`) so it renders directly in the Claude Artifact panel
 - Standing workflow established: every code change is now delivered as both the production `app.jsx` (browser-build format, for GitHub/Vercel) and a synced `app-preview.jsx` (for in-chat preview), kept byte-identical except for the two bootstrap lines

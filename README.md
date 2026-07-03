@@ -1,4 +1,4 @@
-# PF Stock — v0.9.0-beta
+# PF Stock — v1.0.1
 
 Inventario de repuestos industriales. Single-file React PWA, sin backend, sin bundler.
 

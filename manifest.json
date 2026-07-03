@@ -2,7 +2,7 @@
   "name": "PF Stock — Repuestos",
   "short_name": "PF Stock",
   "description": "Gestión de inventario de repuestos industriales",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "start_url": "./",
   "scope": "./",
   "display": "standalone",
