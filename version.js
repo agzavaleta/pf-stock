@@ -7,4 +7,4 @@
 // BUILD_VERSION in service-worker.js, which is the internal deploy counter
 // that triggers the PWA update dialog — bump that separately on every
 // deploy, regardless of whether APP_VERSION changes.
-var APP_VERSION = "1.0.0";
+var APP_VERSION = "1.0.1";

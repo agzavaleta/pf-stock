@@ -476,6 +476,28 @@ function clearState() {
 // data.schemaVersion here if PF_SCHEMA_VERSION is ever bumped; unknown or
 // missing fields fall back to safe defaults so a corrupt/partial record
 // never blocks app startup.
+//
+// Subfamilies reconciliation: a persisted `subfamilies` array always shadows
+// the SUBFAMILIES_DATA constant on load, so newly-added master-data codes
+// (e.g. R710) would otherwise never reach installs that already have a saved
+// state. To fix this without discarding user/persisted data, persisted
+// entries are merged with SUBFAMILIES_DATA by normalized code: persisted
+// entries win on conflict (their edits are preserved), and any code present
+// only in SUBFAMILIES_DATA is added. Nothing persisted is ever removed here.
+function pfReconcileSubfamilies(persisted) {
+  const sfMap = {};
+  (Array.isArray(persisted) ? persisted : []).forEach(s => {
+    if (!s || !s.code) return;
+    const code = String(s.code).trim().toUpperCase();
+    sfMap[code] = { ...s, code };
+  });
+  SUBFAMILIES_DATA.forEach(s => {
+    const code = String(s.code).trim().toUpperCase();
+    if (!(code in sfMap)) sfMap[code] = { ...s, code };
+  });
+  return Object.values(sfMap);
+}
+
 function pfMigrate(data) {
   if (!data || typeof data !== "object") return null;
   return {
@@ -483,7 +505,7 @@ function pfMigrate(data) {
     inv: data.inv || {},
     history: data.history || [],
     audits: data.audits || [],
-    subfamilies: data.subfamilies || SUBFAMILIES_DATA,
+    subfamilies: pfReconcileSubfamilies(data.subfamilies),
     plantsMeta: data.plantsMeta || PLANTS_META_DATA,
     users: data.users || []
   };
@@ -528,6 +550,56 @@ function App() {
 
   // Scroll to top on every view/navigation change
   useEffect(() => { window.scrollTo(0, 0); }, [page, plantSel, sfSel]);
+
+  // ─── Pull-to-refresh (touch devices only, only when already at scroll top) ─
+  const mainScrollRef = useRef(null);
+  useEffect(() => {
+    const el = mainScrollRef.current;
+    if (!el) return;
+    const PULL_THRESHOLD = 70;
+    let startY = null;
+    let pulling = false;
+
+    const onTouchStart = (e) => {
+      // Don't arm pull-to-refresh when the touch starts on an interactive
+      // control (checkboxes, inputs, buttons, links, selects, labels) — those
+      // need normal tap behavior. This is what was blocking "Verificado" taps
+      // on mobile: the whole scroll container was arming on every touchstart.
+      if (e.target.closest && e.target.closest("input, button, select, textarea, a, label")) {
+        startY = null;
+        pulling = false;
+        return;
+      }
+      if (el.scrollTop <= 0) {
+        startY = e.touches[0].clientY;
+        pulling = true;
+      } else {
+        startY = null;
+        pulling = false;
+      }
+    };
+    const onTouchMove = (e) => {
+      if (!pulling || startY === null) return;
+      if (e.touches[0].clientY - startY <= 0) { pulling = false; startY = null; }
+    };
+    const onTouchEnd = (e) => {
+      if (pulling && startY !== null && el.scrollTop <= 0) {
+        const endY = e.changedTouches && e.changedTouches[0] ? e.changedTouches[0].clientY : startY;
+        if (endY - startY > PULL_THRESHOLD) window.location.reload();
+      }
+      pulling = false;
+      startY = null;
+    };
+
+    el.addEventListener("touchstart", onTouchStart, { passive: true });
+    el.addEventListener("touchmove", onTouchMove, { passive: true });
+    el.addEventListener("touchend", onTouchEnd, { passive: true });
+    return () => {
+      el.removeEventListener("touchstart", onTouchStart);
+      el.removeEventListener("touchmove", onTouchMove);
+      el.removeEventListener("touchend", onTouchEnd);
+    };
+  }, []);
 
   // Autosave
   useEffect(() => {
@@ -785,9 +857,15 @@ function App() {
       unit: p.unit, verified: p.verified,
       diff: p.physicalQty !== null ? p.physicalQty - p.systemQty : null,
     }));
+    const nowLocal = new Date();
+    let auditTimestamp = nowLocal;
+    if (auditDate) {
+      const [y, m, d] = auditDate.split("-").map(Number);
+      auditTimestamp = new Date(y, m - 1, d, nowLocal.getHours(), nowLocal.getMinutes(), nowLocal.getSeconds(), nowLocal.getMilliseconds());
+    }
     const newAudit = {
       id: Date.now(),
-      date: auditDate ? new Date(auditDate + "T12:00:00").toISOString() : new Date().toISOString(),
+      date: auditTimestamp.toISOString(),
       user,
       userId,
       plantCode,
@@ -917,7 +995,7 @@ function App() {
       )}
 
       {/* Single PageContent instance — never unmounts on resize */}
-      <main style={{ marginLeft: wide ? 220 : 0, flex: 1, width: wide ? "calc(100% - 220px)" : "100%", boxSizing: "border-box", padding: wide ? "24px" : "12px 14px", paddingBottom: wide ? 0 : 72, overflow: "auto" }}>
+      <main ref={mainScrollRef} style={{ marginLeft: wide ? 220 : 0, flex: 1, width: wide ? "calc(100% - 220px)" : "100%", boxSizing: "border-box", padding: wide ? "24px" : "12px 14px", paddingBottom: wide ? 0 : 72, overflow: "auto" }}>
         <PageContent page={page} {...pageProps} wide={wide} mid={mid} />
       </main>
 
@@ -1026,7 +1104,7 @@ function DashboardPage({ parts, totalVal, verifiedCount, diffCount, navigate, wi
             }}>
               <div style={{ fontSize: 12, color: "#374151", marginBottom: 4 }}>{t.label}</div>
               <div style={{ fontSize: 22, fontWeight: 700, color: t.color, lineHeight: 1.2 }}>{t.value}</div>
-              {t.sub && <div style={{ fontSize: 12, color: t.color, marginTop: 4, opacity: 0.8 }}>{t.sub} completado</div>}
+              {t.sub && <div style={{ fontSize: 12, color: t.color, marginTop: 4 }}>{t.sub} completado</div>}
             </div>
           );
         })}
@@ -1064,7 +1142,7 @@ function DashboardPage({ parts, totalVal, verifiedCount, diffCount, navigate, wi
                           {p.total === 0
                             ? <div style={{ fontSize: 9, color: "#6b7280", textAlign: "center", lineHeight: 1.3 }}>Sin sub-<br/>familias</div>
                             : <>
-                                <div style={{ fontSize: 15, fontWeight: 800, color: auditedPct === 100 ? "#16a34a" : p.color, lineHeight: 1 }}>{auditedPct}%</div>
+                                <div style={{ fontSize: 15, fontWeight: 800, color: auditedPct === 100 ? "#166534" : p.color, lineHeight: 1 }}>{auditedPct}%</div>
                                 <div style={{ fontSize: 9, color: "#6b7280", marginTop: 1 }}>audit.</div>
                               </>
                           }
@@ -1226,7 +1304,7 @@ function PlantsPage({ parts, plantSel, setPlantSel, sfSel, setSfSel, history, au
                       const pct = sp.length ? Math.round((v / sp.length) * 100) : 0;
                       return (
                         <tr key={sf.code} style={{ cursor: "pointer" }} onClick={() => setSfSel(sf.code)}>
-                          <td style={S.td}><span style={{ fontFamily: "monospace", fontSize: 12 }}>{sf.code}</span></td>
+                          <td style={S.td}><span style={{ fontSize: 12 }}>{sf.code}</span></td>
                           <td style={S.td}><span style={{ fontWeight: 500 }}>{sf.name}</span></td>
                           <td style={S.td}>{sp.length}</td>
                           <td style={S.td}>
@@ -1261,10 +1339,10 @@ function PlantsPage({ parts, plantSel, setPlantSel, sfSel, setSfSel, history, au
                     }}>
                       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 6 }}>
                         <div style={{ flex: 1, minWidth: 0 }}>
-                          <div style={{ fontSize: 11, color: "#6b7280", fontFamily: "monospace" }}>{sf.code}</div>
+                          <div style={{ fontSize: 11, color: "#6b7280" }}>{sf.code}</div>
                           <div style={{ fontSize: 13, fontWeight: 500, color: "#111827", lineHeight: 1.4, marginTop: 2 }}>{sf.name}</div>
                         </div>
-                        <span style={{ fontSize: 12, fontWeight: 700, color: d > 0 ? "#dc2626" : pct === 100 ? "#16a34a" : (meta.color || "#2563eb"), marginLeft: 8, flexShrink: 0 }}>{pct}%</span>
+                        <span style={{ fontSize: 12, fontWeight: 700, color: d > 0 ? "#dc2626" : pct === 100 ? "#166534" : (meta.color || "#2563eb"), marginLeft: 8, flexShrink: 0 }}>{pct}%</span>
                       </div>
                       <div style={{ background: d > 0 ? "#fecaca" : pct === 100 ? "#bbf7d0" : "#f3f4f6", borderRadius: 4, height: 5, marginBottom: 8 }}>
                         <div style={{ width: `${pct}%`, height: "100%", background: d > 0 ? "#dc2626" : pct === 100 ? "#16a34a" : (meta.color || "#2563eb"), borderRadius: 4 }} />
@@ -1463,7 +1541,7 @@ function SubfamilyDashboard({ sfSel, setSfSel, plantSel, setPlantSel, parts, aud
       <div style={{ ...S.card, marginBottom: 16, borderLeft: `4px solid ${color}` }}>
         <div style={{ display: "flex", flexDirection: wide ? "row" : "column", justifyContent: "space-between", alignItems: wide ? "flex-start" : "stretch", gap: 12 }}>
           <div style={{ flex: 1, minWidth: 0 }}>
-            <div style={{ fontSize: 11, color: "#6b7280", fontFamily: "monospace", marginBottom: 2 }}>{sfSel}</div>
+            <div style={{ fontSize: 11, color: "#6b7280", marginBottom: 2 }}>{sfSel}</div>
             <h1 style={{ fontSize: 17, fontWeight: 700, color: "#111827", margin: "0 0 6px", lineHeight: 1.3 }}>{sf?.name || sfSel}</h1>
             <div style={{ background: "#f3f4f6", borderRadius: 4, height: 6, marginBottom: 6, maxWidth: 280 }}>
               <div style={{ width: `${sfPct}%`, height: "100%", background: sfPct === 100 ? "#16a34a" : color, borderRadius: 4, transition: "width 0.4s" }} />
@@ -1484,7 +1562,7 @@ function SubfamilyDashboard({ sfSel, setSfSel, plantSel, setPlantSel, parts, aud
           <div key={t.label} style={{ background: t.bg, border: `1px solid ${t.border}`, borderRadius: 12, padding: "14px 16px" }}>
             <div style={{ fontSize: 12, color: "#374151", marginBottom: 4 }}>{t.label}</div>
             <div style={{ fontSize: 20, fontWeight: 700, color: t.color, lineHeight: 1.2 }}>{t.value}</div>
-            {t.sub && <div style={{ fontSize: 12, color: t.color, marginTop: 4, opacity: 0.8 }}>{t.sub} completado</div>}
+            {t.sub && <div style={{ fontSize: 12, color: t.color, marginTop: 4 }}>{t.sub} completado</div>}
           </div>
         ))}
       </div>
@@ -1542,7 +1620,7 @@ function SubfamilyDashboard({ sfSel, setSfSel, plantSel, setPlantSel, parts, aud
                 </div>
               </div>
               <div style={{ display: "flex", gap: 8, alignItems: "center", flexShrink: 0 }}>
-                <span style={{ ...S.badge(last.status === "Completado" ? "#16a34a" : "#b45309", last.status === "Completado" ? "#f0fdf4" : "#fffbeb") }}>{last.status}</span>
+                <span style={{ ...S.badge(last.status === "Completado" ? "#166534" : "#b45309", last.status === "Completado" ? "#f0fdf4" : "#fffbeb") }}>{last.status}</span>
                 <button onClick={() => { const el = document.getElementById("sf-audit-history"); el?.scrollIntoView({ behavior: "smooth" }); }}
                   style={{ ...S.btn(), fontSize: 11, padding: "4px 10px", color: color, border: `1px solid ${color}` }}>
                   Ver historial
@@ -1554,9 +1632,9 @@ function SubfamilyDashboard({ sfSel, setSfSel, plantSel, setPlantSel, parts, aud
             <div style={{ display: "grid", gridTemplateColumns: wide ? "repeat(4, 1fr)" : "repeat(2, 1fr)", gap: 10, marginBottom: 16 }}>
               {[
                 { label: "Ítems auditados", value: fmtN(last.totalItems), color: "#374151", bg: "#f9fafb", border: "#e5e7eb" },
-                { label: "Cumplimiento", value: `${compliancePct}%`, color: compliancePct === 100 ? "#16a34a" : compliancePct >= 75 ? "#b45309" : "#dc2626", bg: compliancePct === 100 ? "#f0fdf4" : compliancePct >= 75 ? "#fffbeb" : "#fef2f2", border: compliancePct === 100 ? "#bbf7d0" : compliancePct >= 75 ? "#fde68a" : "#fecaca" },
+                { label: "Cumplimiento", value: `${compliancePct}%`, color: compliancePct === 100 ? "#166534" : compliancePct >= 75 ? "#b45309" : "#b91c1c", bg: compliancePct === 100 ? "#f0fdf4" : compliancePct >= 75 ? "#fffbeb" : "#fef2f2", border: compliancePct === 100 ? "#bbf7d0" : compliancePct >= 75 ? "#fde68a" : "#fecaca" },
                 { label: "Hallazgos", value: fmtN(findingsItems), color: findingsItems > 0 ? "#b45309" : "#6b7280", bg: findingsItems > 0 ? "#fffbeb" : "#f9fafb", border: findingsItems > 0 ? "#fde68a" : "#e5e7eb" },
-                { label: "Varianza ($)", value: fmtCLP(lastVariance), color: lastVariance < 0 ? "#dc2626" : lastVariance > 0 ? "#16a34a" : "#6b7280", bg: lastVariance < 0 ? "#fef2f2" : lastVariance > 0 ? "#f0fdf4" : "#f9fafb", border: lastVariance < 0 ? "#fecaca" : lastVariance > 0 ? "#bbf7d0" : "#e5e7eb" },
+                { label: "Varianza ($)", value: fmtCLP(lastVariance), color: lastVariance < 0 ? "#b91c1c" : lastVariance > 0 ? "#166534" : "#6b7280", bg: lastVariance < 0 ? "#fef2f2" : lastVariance > 0 ? "#f0fdf4" : "#f9fafb", border: lastVariance < 0 ? "#fecaca" : lastVariance > 0 ? "#bbf7d0" : "#e5e7eb" },
               ].map(t => (
                 <div key={t.label} style={{ background: t.bg, border: `1px solid ${t.border}`, borderRadius: 10, padding: "11px 13px" }}>
                   <div style={{ fontSize: 11, color: "#6b7280", marginBottom: 4 }}>{t.label}</div>
@@ -1573,7 +1651,7 @@ function SubfamilyDashboard({ sfSel, setSfSel, plantSel, setPlantSel, parts, aud
                 <div style={{ position: "relative", flexShrink: 0 }}>
                   <div style={{ width: 72, height: 72, borderRadius: "50%", background: donutGrad, display: "flex", alignItems: "center", justifyContent: "center" }}>
                     <div style={{ width: 46, height: 46, borderRadius: "50%", background: "#f9fafb", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center" }}>
-                      <div style={{ fontSize: 13, fontWeight: 800, color: compliancePct === 100 ? "#16a34a" : color, lineHeight: 1 }}>{compliancePct}%</div>
+                      <div style={{ fontSize: 13, fontWeight: 800, color: compliancePct === 100 ? "#166534" : color, lineHeight: 1 }}>{compliancePct}%</div>
                     </div>
                   </div>
                 </div>
@@ -1607,7 +1685,7 @@ function SubfamilyDashboard({ sfSel, setSfSel, plantSel, setPlantSel, parts, aud
               {/* Monetary variance */}
               <div style={{ background: "#f9fafb", borderRadius: 10, padding: "14px" }}>
                 <div style={{ fontSize: 12, fontWeight: 600, color: "#374151", marginBottom: 6 }}>Varianza monetaria</div>
-                <div style={{ fontSize: 18, fontWeight: 700, color: lastVariance < 0 ? "#dc2626" : lastVariance > 0 ? "#16a34a" : "#6b7280", marginBottom: 4 }}>
+                <div style={{ fontSize: 18, fontWeight: 700, color: lastVariance < 0 ? "#dc2626" : lastVariance > 0 ? "#166534" : "#6b7280", marginBottom: 4 }}>
                   {lastVariance > 0 ? "+" : ""}{fmtCLP(lastVariance)}
                 </div>
                 {findingsItems > 0 && (
@@ -1622,14 +1700,14 @@ function SubfamilyDashboard({ sfSel, setSfSel, plantSel, setPlantSel, parts, aud
             {/* Top affected items */}
             {topAffected.length > 0 && (
               <div>
-                <div style={{ fontSize: 11, fontWeight: 600, color: "#6b7280", textTransform: "uppercase", letterSpacing: "0.05em", marginBottom: 8 }}>Ítems más afectados</div>
+                <div style={{ fontSize: 11, fontWeight: 600, color: "#6b7280", textTransform: "uppercase", letterSpacing: "0.05em", marginBottom: 8 }}>Ítems afectados</div>
                 {topAffected.map((p, i) => (
                   <div key={p.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "6px 0", borderBottom: i < topAffected.length - 1 ? "1px solid #f3f4f6" : "none" }}>
                     <div style={{ flex: 1, minWidth: 0 }}>
                       <div style={{ fontSize: 12, fontWeight: 500, color: "#111827", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{p.code} - {p.name}</div>
                       <div style={{ fontSize: 11, color: "#6b7280" }}>Sist: {fmtN(p.systemQty)} → Fís: {p.physicalQty !== null ? fmtN(p.physicalQty) : "—"}</div>
                     </div>
-                    <span style={{ ...S.badge(p.diff < 0 ? "#dc2626" : "#f59e0b", p.diff < 0 ? "#fef2f2" : "#fffbeb"), flexShrink: 0, marginLeft: 10 }}>
+                    <span style={{ ...S.badge(p.diff < 0 ? "#b91c1c" : "#92400e", p.diff < 0 ? "#fef2f2" : "#fffbeb"), flexShrink: 0, marginLeft: 10 }}>
                       {p.diff > 0 ? "+" : ""}{fmtN(p.diff)}
                     </span>
                   </div>
@@ -1674,7 +1752,7 @@ function SubfamilyDashboard({ sfSel, setSfSel, plantSel, setPlantSel, parts, aud
                     return (
                       <g key={pct}>
                         <line x1={PL} y1={y} x2={PL + chartWS} y2={y} stroke="#f3f4f6" strokeWidth="1" />
-                        <text x={PL - 4} y={y + 4} textAnchor="end" fontSize="9" fill="#9ca3af">{fmtCLP(Math.round(maxVal * pct / 100))}</text>
+                        <text x={PL - 4} y={y + 4} textAnchor="end" fontSize="9" fill="#6b7280">{fmtCLP(Math.round(maxVal * pct / 100))}</text>
                         <text x={PL + chartWS + 4} y={y + 4} textAnchor="start" fontSize="9" fill="#6b7280">{pct}%</text>
                       </g>
                     );
@@ -1920,7 +1998,7 @@ function SfAuditHistory({ audits, plantColor, wide, onDelete, users, handleUpdat
                       title="Editar fecha"
                       style={{ ...S.input, fontSize: 11, padding: "3px 6px", width: "auto", minWidth: 110 }} />
                   )}
-                  <span style={{ ...S.badge(a.status === "Completado" ? "#16a34a" : a.status === "Borrador" ? "#6b7280" : "#b45309", a.status === "Completado" ? "#f0fdf4" : a.status === "Borrador" ? "#f3f4f6" : "#fffbeb") }}>{a.status}</span>
+                  <span style={{ ...S.badge(a.status === "Completado" ? "#166534" : a.status === "Borrador" ? "#374151" : "#b45309", a.status === "Completado" ? "#f0fdf4" : a.status === "Borrador" ? "#f3f4f6" : "#fffbeb") }}>{a.status}</span>
                   {a.status === "Borrador" && onEditDraft && (
                     <button onClick={() => onEditDraft(a)} style={{ ...S.btn(), padding: "4px 8px", fontSize: 11, color: "#2563eb", border: "1px solid #bfdbfe" }}>
                       <Icon name="edit" size={11} color="#2563eb" /> Editar
@@ -1967,7 +2045,7 @@ function SfAuditHistory({ audits, plantColor, wide, onDelete, users, handleUpdat
                       {[["Total", fmtN(a.totalItems)], ["Verificados", fmtN(a.verifiedItems)], ["Diferencias", fmtN(a.diffItems)], ["Varianza", fmtCLP(totalVariance)]].map(([l, v]) => (
                         <div key={l} style={{ background: "#f9fafb", borderRadius: 6, padding: "6px 8px" }}>
                           <div style={{ fontSize: 10, color: "#374151" }}>{l}</div>
-                          <div style={{ fontSize: 12, fontWeight: 700, color: l === "Diferencias" && a.diffItems > 0 ? "#dc2626" : l === "Varianza" && totalVariance < 0 ? "#dc2626" : l === "Varianza" && totalVariance > 0 ? "#16a34a" : "#111827" }}>{v}</div>
+                          <div style={{ fontSize: 12, fontWeight: 700, color: l === "Diferencias" && a.diffItems > 0 ? "#dc2626" : l === "Varianza" && totalVariance < 0 ? "#dc2626" : l === "Varianza" && totalVariance > 0 ? "#166534" : "#111827" }}>{v}</div>
                         </div>
                       ))}
                     </div>
@@ -1994,17 +2072,17 @@ function SfAuditHistory({ audits, plantColor, wide, onDelete, users, handleUpdat
                             const hasDiff = p.diff !== null && p.diff !== 0;
                             return (
                               <tr key={p.id} style={{ background: isPareto ? "#fffbeb" : hasDiff ? "#fef9f9" : p.verified ? "#f9fefb" : "transparent", borderLeft: `3px solid ${isPareto ? "#f59e0b" : "transparent"}` }}>
-                                <td style={{ ...S.td, fontFamily: "monospace", fontSize: 11 }}>{p.code}</td>
+                                <td style={{ ...S.td, fontSize: 11 }}>{p.code}</td>
                                 <td style={{ ...S.td, maxWidth: 180, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{p.name}</td>
                                 <td style={{ ...S.td, textAlign: "right" }}>{fmtN(p.systemQty)} {p.unit}</td>
                                 <td style={{ ...S.td, textAlign: "right" }}>{p.physicalQty !== null ? `${fmtN(p.physicalQty)} ${p.unit}` : <span style={{ color: "#6b7280" }}>—</span>}</td>
                                 <td style={{ ...S.td, textAlign: "right" }}>
-                                  {hasDiff ? <span style={{ fontWeight: 700, color: p.diff < 0 ? "#dc2626" : "#16a34a" }}>{p.diff > 0 ? "+" : ""}{fmtN(p.diff)}</span> : <span style={{ color: "#6b7280" }}>—</span>}
+                                  {hasDiff ? <span style={{ fontWeight: 700, color: p.diff < 0 ? "#dc2626" : "#166534" }}>{p.diff > 0 ? "+" : ""}{fmtN(p.diff)}</span> : <span style={{ color: "#6b7280" }}>—</span>}
                                 </td>
                                 <td style={{ ...S.td, textAlign: "right" }}>{fmtCLP(p.unitValue)}</td>
                                 <td style={{ ...S.td, textAlign: "right", fontWeight: 600 }}>{fmtCLP(p.total)}</td>
                                 <td style={{ ...S.td, textAlign: "right" }}>
-                                  {p.diffVal !== null ? <span style={{ fontWeight: 700, color: p.diffVal < 0 ? "#dc2626" : "#16a34a" }}>{p.diffVal > 0 ? "+" : ""}{fmtCLP(p.diffVal)}</span> : <span style={{ color: "#6b7280" }}>—</span>}
+                                  {p.diffVal !== null ? <span style={{ fontWeight: 700, color: p.diffVal < 0 ? "#dc2626" : "#166534" }}>{p.diffVal > 0 ? "+" : ""}{fmtCLP(p.diffVal)}</span> : <span style={{ color: "#6b7280" }}>—</span>}
                                 </td>
                                 <td style={{ ...S.td, textAlign: "right", color: "#6b7280" }}>{p.pctVal.toFixed(1)}%</td>
                                 <td style={{ ...S.td, textAlign: "right", whiteSpace: "nowrap" }}>
@@ -2019,7 +2097,7 @@ function SfAuditHistory({ audits, plantColor, wide, onDelete, users, handleUpdat
                           <tfoot>
                             <tr style={{ background: "#f9fafb", borderTop: "2px solid #e5e7eb" }}>
                               <td colSpan={7} style={{ ...S.td, fontWeight: 700, color: "#374151" }}>Varianza total del inventario</td>
-                              <td style={{ ...S.td, textAlign: "right", fontWeight: 800, color: totalVariance < 0 ? "#dc2626" : "#16a34a", fontSize: 13 }}>
+                              <td style={{ ...S.td, textAlign: "right", fontWeight: 800, color: totalVariance < 0 ? "#dc2626" : "#166534", fontSize: 13 }}>
                                 {totalVariance > 0 ? "+" : ""}{fmtCLP(totalVariance)}
                               </td>
                               <td colSpan={2} style={S.td} />
@@ -2368,7 +2446,7 @@ function PlantHistoryPanel({ plantHistory, wide }) {
                   <td style={S.td}>{new Date(h.date).toLocaleDateString("es-CL")} {new Date(h.date).toLocaleTimeString("es-CL", { hour: "2-digit", minute: "2-digit" })}</td>
                   <td style={S.td}>{fmtN(h.items)}</td>
                   <td style={S.td}><span style={{ fontWeight: 600 }}>{fmtCLP(h.value)}</span></td>
-                  <td style={S.td}><span style={{ ...S.badge("#16a34a", "#f0fdf4") }}>Importado</span></td>
+                  <td style={S.td}><span style={{ ...S.badge("#166534", "#f0fdf4") }}>Importado</span></td>
                 </tr>
               ))}
             </tbody>
@@ -2381,7 +2459,7 @@ function PlantHistoryPanel({ plantHistory, wide }) {
               <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 5 }}>
                 <Icon name="file" size={13} color="#9ca3af" />
                 <span style={{ fontSize: 13, fontWeight: 500, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1 }}>{h.fileName}</span>
-                <span style={{ ...S.badge("#16a34a", "#f0fdf4"), flexShrink: 0 }}>Importado</span>
+                <span style={{ ...S.badge("#166534", "#f0fdf4"), flexShrink: 0 }}>Importado</span>
               </div>
               <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, color: "#6b7280" }}>
                 <span>{new Date(h.date).toLocaleDateString("es-CL")} {new Date(h.date).toLocaleTimeString("es-CL", { hour: "2-digit", minute: "2-digit" })}</span>
@@ -2401,7 +2479,7 @@ function StatusCounters({ total, verified, diffs, pending, pct, barColor, active
   const tiles = [
     { id: "all",      label: L.all,      count: total,    color: "#374151", bg: "#f9fafb", border: "#e5e7eb" },
     { id: "verified", label: L.verified, count: verified, color: "#166534", bg: "#f0fdf4", border: "#bbf7d0" },
-    { id: "diffs",    label: L.diffs,    count: diffs,    color: diffs > 0 ? "#dc2626" : "#6b7280", bg: diffs > 0 ? "#fef2f2" : "#f9fafb", border: diffs > 0 ? "#fecaca" : "#e5e7eb" },
+    { id: "diffs",    label: L.diffs,    count: diffs,    color: diffs > 0 ? "#b91c1c" : "#6b7280", bg: diffs > 0 ? "#fef2f2" : "#f9fafb", border: diffs > 0 ? "#fecaca" : "#e5e7eb" },
     { id: "pending",  label: L.pending,  count: pending,  color: pending > 0 ? "#b45309" : "#6b7280", bg: pending > 0 ? "#fffbeb" : "#f9fafb", border: pending > 0 ? "#fde68a" : "#e5e7eb" },
   ];
   return (
@@ -2421,7 +2499,7 @@ function StatusCounters({ total, verified, diffs, pending, pct, barColor, active
               }}
             >
               <div style={{ fontSize: 18, fontWeight: 700, color: t.color, lineHeight: 1.1 }}>{fmtN(t.count)}</div>
-              <div style={{ fontSize: 10, color: t.color, opacity: 0.75, marginTop: 2, fontWeight: 500 }}>{t.label}</div>
+              <div style={{ fontSize: 10, color: t.color, marginTop: 2, fontWeight: 500 }}>{t.label}</div>
             </div>
           );
         })}
@@ -2498,25 +2576,27 @@ function PlantVerifyPanel({ parts, onVerify, onPhysQty, wide, plantColor, plantC
             </div>
             <div style={{ marginBottom: 20 }}>
               <label style={{ fontSize: 12, fontWeight: 600, color: "#374151", display: "block", marginBottom: 5 }}>Auditor <span style={{ color: "#b91c1c" }}>*</span></label>
-              {users && users.length > 0 ? (
-                <select value={auditUser} onChange={e => {
-                    const sel = users.find(u => `${u.nombre} ${u.apellido}` === e.target.value);
-                    setAuditUser(e.target.value);
-                    setAuditUserId(sel ? sel.id : null);
-                  }}
-                  style={{ ...S.input, background: "#fff", borderColor: !auditUser.trim() ? "#fca5a5" : "#d1d5db" }}>
-                  <option value="">Seleccionar auditor…</option>
-                  {users.map(u => {
-                    const display = `${u.nombre} ${u.apellido}`;
-                    return <option key={u.id} value={display}>{display}</option>;
-                  })}
-                </select>
-              ) : (
-                <input value={auditUser} onChange={e => setAuditUser(e.target.value)} placeholder="Ingresa tu nombre…"
-                  style={{ ...S.input, borderColor: !auditUser.trim() ? "#fca5a5" : "#d1d5db" }}
-                  onKeyDown={e => e.key === "Enter" && doSave("Completado")} autoFocus />
-              )}
-              {!auditUser.trim() && <div style={{ fontSize: 11, color: "#b91c1c", marginTop: 4 }}>Requerido</div>}
+              <select value={auditUser} disabled={!users || users.length === 0}
+                onChange={e => {
+                  const sel = users.find(u => `${u.nombre} ${u.apellido}` === e.target.value);
+                  setAuditUser(e.target.value);
+                  setAuditUserId(sel ? sel.id : null);
+                }}
+                style={{ ...S.input,
+                  background: users && users.length > 0 ? "#fff" : "#f3f4f6",
+                  color: users && users.length > 0 ? "#111827" : "#374151",
+                  borderColor: !auditUser.trim() ? "#fca5a5" : "#d1d5db",
+                }}>
+                <option value="">Seleccionar auditor…</option>
+                {users && users.map(u => {
+                  const display = `${u.nombre} ${u.apellido}`;
+                  return <option key={u.id} value={display}>{display}</option>;
+                })}
+              </select>
+              {(!users || users.length === 0)
+                ? <div style={{ fontSize: 11, color: "#b91c1c", marginTop: 4 }}>No existen usuarios creados</div>
+                : !auditUser.trim() && <div style={{ fontSize: 11, color: "#b91c1c", marginTop: 4 }}>Requerido</div>
+              }
             </div>
             <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
               <button onClick={() => doSave("Completado")} disabled={!auditUser.trim() || isSaving}
@@ -2602,7 +2682,7 @@ function PlantAuditPanel({ audits, wide, plantColor, onDelete, users, handleUpda
     const detailTiles = [
       { id: "all",      label: "Total ítems",    value: fmtN(openAudit.totalItems),    color: "#374151", bg: "#f9fafb", border: "#e5e7eb" },
       { id: "verified", label: "Verificados",     value: fmtN(openAudit.verifiedItems), color: "#166534", bg: "#f0fdf4", border: "#bbf7d0" },
-      { id: "diffs",    label: "Con diferencias", value: fmtN(openAudit.diffItems),     color: openAudit.diffItems > 0 ? "#dc2626" : "#6b7280", bg: openAudit.diffItems > 0 ? "#fef2f2" : "#f9fafb", border: openAudit.diffItems > 0 ? "#fecaca" : "#e5e7eb" },
+      { id: "diffs",    label: "Con diferencias", value: fmtN(openAudit.diffItems),     color: openAudit.diffItems > 0 ? "#b91c1c" : "#6b7280", bg: openAudit.diffItems > 0 ? "#fef2f2" : "#f9fafb", border: openAudit.diffItems > 0 ? "#fecaca" : "#e5e7eb" },
       { id: "pending",  label: "Pendientes",      value: fmtN(openAudit.totalItems - openAudit.verifiedItems), color: "#92400e", bg: "#fffbeb", border: "#fde68a" },
     ];
     return (
@@ -2622,7 +2702,7 @@ function PlantAuditPanel({ audits, wide, plantColor, onDelete, users, handleUpda
                 {new Date(openAudit.date).toLocaleTimeString("es-CL", { hour: "2-digit", minute: "2-digit" })} · Auditor: {resolveUser(openAudit, users)}
               </div>
             </div>
-            <span style={{ ...S.badge(openAudit.status === "Completado" ? "#16a34a" : "#b45309", openAudit.status === "Completado" ? "#f0fdf4" : "#fffbeb") }}>
+            <span style={{ ...S.badge(openAudit.status === "Completado" ? "#166534" : "#b45309", openAudit.status === "Completado" ? "#f0fdf4" : "#fffbeb") }}>
               {openAudit.status}
             </span>
           </div>
@@ -2649,7 +2729,7 @@ function PlantAuditPanel({ audits, wide, plantColor, onDelete, users, handleUpda
             {auditDetailFilter === "all" ? `Todos los ítems (${openAudit.snapshot.length})` : auditDetailFilter === "verified" ? `Verificados (${verified.length})` : auditDetailFilter === "diffs" ? `Con diferencias (${diffs.length})` : `Pendientes (${pending.length})`}
           </div>
           {totalVariance !== 0 && (
-            <div style={{ fontSize: 12, color: totalVariance < 0 ? "#dc2626" : "#16a34a", fontWeight: 600, marginBottom: 10 }}>
+            <div style={{ fontSize: 12, color: totalVariance < 0 ? "#dc2626" : "#166534", fontWeight: 600, marginBottom: 10 }}>
               Varianza monetaria total: <span style={{ fontSize: 13 }}>{totalVariance > 0 ? "+" : ""}{fmtCLP(totalVariance)}</span>
             </div>
           )}
@@ -2671,16 +2751,16 @@ function PlantAuditPanel({ audits, wide, plantColor, onDelete, users, handleUpda
                     const diffVal = hasDiff ? p.diff * p.unitValue : null;
                     return (
                       <tr key={p.id} style={{ background: hasDiff ? "#fef9f9" : p.verified ? "#f9fefb" : "transparent" }}>
-                        <td style={S.td}><span style={{ fontFamily: "monospace", fontSize: 11 }}>{p.code}</span></td>
+                        <td style={S.td}><span style={{ fontSize: 11 }}>{p.code}</span></td>
                         <td style={{ ...S.td, maxWidth: 200 }}>{p.name}</td>
                         <td style={{ ...S.td, textAlign: "right" }}>{fmtN(p.systemQty)} {p.unit}</td>
                         <td style={{ ...S.td, textAlign: "right" }}>{p.physicalQty !== null ? `${fmtN(p.physicalQty)} ${p.unit}` : <span style={{ color: "#6b7280" }}>—</span>}</td>
                         <td style={{ ...S.td, textAlign: "right" }}>
-                          {hasDiff ? <span style={{ fontWeight: 700, color: p.diff < 0 ? "#dc2626" : "#16a34a" }}>{p.diff > 0 ? "+" : ""}{fmtN(p.diff)}</span> : <span style={{ color: "#6b7280" }}>—</span>}
+                          {hasDiff ? <span style={{ fontWeight: 700, color: p.diff < 0 ? "#dc2626" : "#166534" }}>{p.diff > 0 ? "+" : ""}{fmtN(p.diff)}</span> : <span style={{ color: "#6b7280" }}>—</span>}
                         </td>
                         <td style={{ ...S.td, textAlign: "right", fontWeight: 600 }}>{fmtCLP((p.physicalQty ?? p.systemQty) * p.unitValue)}</td>
                         <td style={{ ...S.td, textAlign: "right" }}>
-                          {diffVal !== null ? <span style={{ fontWeight: 700, color: diffVal < 0 ? "#dc2626" : "#16a34a" }}>{diffVal > 0 ? "+" : ""}{fmtCLP(diffVal)}</span> : <span style={{ color: "#6b7280" }}>—</span>}
+                          {diffVal !== null ? <span style={{ fontWeight: 700, color: diffVal < 0 ? "#dc2626" : "#166534" }}>{diffVal > 0 ? "+" : ""}{fmtCLP(diffVal)}</span> : <span style={{ color: "#6b7280" }}>—</span>}
                         </td>
                       </tr>
                     );
@@ -2696,15 +2776,15 @@ function PlantAuditPanel({ audits, wide, plantColor, onDelete, users, handleUpda
                 return (
                   <div key={p.id} style={{ ...S.card, padding: "10px 12px", border: `1px solid ${hasDiff ? "#fecaca" : p.verified ? "#bbf7d0" : "#e5e7eb"}` }}>
                     <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
-                      <span style={{ fontSize: 11, color: "#6b7280", fontFamily: "monospace" }}>{p.code}</span>
-                      <span style={{ fontSize: 11, color: p.verified ? "#16a34a" : "#9ca3af", fontWeight: 500 }}>{p.verified ? "✓ verificado" : "pendiente"}</span>
+                      <span style={{ fontSize: 11, color: "#6b7280" }}>{p.code}</span>
+                      <span style={{ fontSize: 11, color: p.verified ? "#166534" : "#6b7280", fontWeight: 500 }}>{p.verified ? "✓ verificado" : "pendiente"}</span>
                     </div>
                     <div style={{ fontSize: 13, fontWeight: 500, marginBottom: 4, lineHeight: 1.3 }}>{p.name}</div>
                     <div style={{ display: "flex", gap: 12, fontSize: 12, color: "#6b7280", flexWrap: "wrap" }}>
                       <span>Sist: <strong style={{ color: "#111827" }}>{fmtN(p.systemQty)}</strong></span>
                       <span>Fís: <strong style={{ color: hasDiff ? "#dc2626" : "#111827" }}>{p.physicalQty !== null ? fmtN(p.physicalQty) : "—"}</strong></span>
-                      {hasDiff && <span style={{ fontWeight: 700, color: p.diff < 0 ? "#dc2626" : "#16a34a" }}>{p.diff > 0 ? "+" : ""}{fmtN(p.diff)}</span>}
-                      {diffVal !== null && <span style={{ fontWeight: 700, color: diffVal < 0 ? "#dc2626" : "#16a34a" }}>{diffVal > 0 ? "+" : ""}{fmtCLP(diffVal)}</span>}
+                      {hasDiff && <span style={{ fontWeight: 700, color: p.diff < 0 ? "#dc2626" : "#166534" }}>{p.diff > 0 ? "+" : ""}{fmtN(p.diff)}</span>}
+                      {diffVal !== null && <span style={{ fontWeight: 700, color: diffVal < 0 ? "#dc2626" : "#166534" }}>{diffVal > 0 ? "+" : ""}{fmtCLP(diffVal)}</span>}
                     </div>
                   </div>
                 );
@@ -2745,7 +2825,7 @@ function PlantAuditPanel({ audits, wide, plantColor, onDelete, users, handleUpda
               boxShadow: isActive ? `0 0 0 2px ${t.color}25` : "none",
             }}>
               <div style={{ fontSize: 16, fontWeight: 700, color: t.color }}>{t.count}</div>
-              <div style={{ fontSize: 10, color: t.color, opacity: 0.75, fontWeight: 500 }}>{t.label}</div>
+              <div style={{ fontSize: 10, color: t.color, fontWeight: 500 }}>{t.label}</div>
             </div>
           );
         })}
@@ -2780,7 +2860,7 @@ function PlantAuditPanel({ audits, wide, plantColor, onDelete, users, handleUpda
                   </div>
                 </div>
                 <div style={{ display: "flex", alignItems: "center", gap: 6, flexShrink: 0, marginLeft: 8 }}>
-                  <span style={{ ...S.badge(a.status === "Completado" ? "#16a34a" : a.status === "Borrador" ? "#6b7280" : "#b45309", a.status === "Completado" ? "#f0fdf4" : a.status === "Borrador" ? "#f3f4f6" : "#fffbeb") }}>{a.status}</span>
+                  <span style={{ ...S.badge(a.status === "Completado" ? "#166534" : a.status === "Borrador" ? "#374151" : "#b45309", a.status === "Completado" ? "#f0fdf4" : a.status === "Borrador" ? "#f3f4f6" : "#fffbeb") }}>{a.status}</span>
                 </div>
               </div>
               {/* Stats */}
@@ -2790,7 +2870,7 @@ function PlantAuditPanel({ audits, wide, plantColor, onDelete, users, handleUpda
                   return [["Ítems", fmtN(a.totalItems)], ["Verificados", fmtN(a.verifiedItems)], ["Diferencias", fmtN(a.diffItems)], ["Varianza", fmtCLP(av)]].map(([l, v]) => (
                     <div key={l}>
                       <div style={{ fontSize: 10, color: "#374151" }}>{l}</div>
-                      <div style={{ fontSize: 12, fontWeight: 600, color: l === "Diferencias" && a.diffItems > 0 ? "#dc2626" : l === "Varianza" && av < 0 ? "#dc2626" : l === "Varianza" && av > 0 ? "#16a34a" : "#111827" }}>{v}</div>
+                      <div style={{ fontSize: 12, fontWeight: 600, color: l === "Diferencias" && a.diffItems > 0 ? "#dc2626" : l === "Varianza" && av < 0 ? "#dc2626" : l === "Varianza" && av > 0 ? "#166534" : "#111827" }}>{v}</div>
                     </div>
                   ));
                 })()}
@@ -3908,7 +3988,7 @@ function PartsTable({ parts, onVerify, onPhysQty, showPlant, plantsMeta }) {
                   <input type="checkbox" checked={p.verified} onChange={e => onVerify(p.id, e.target.checked)} style={{ width: 16, height: 16, cursor: "pointer" }} />
                 </td>
                 {showPlant && <td style={S.td}><span style={{ ...S.badge(plantsMeta[p.plantCode]?.color || "#374151", plantsMeta[p.plantCode]?.bg || "#f3f4f6"), fontSize: 10 }}>{p.plantCode}</span></td>}
-                <td style={S.td}><span style={{ fontFamily: "monospace", fontSize: 11 }}>{p.code}</span></td>
+                <td style={S.td}><span style={{ fontSize: 11 }}>{p.code}</span></td>
                 <td style={{ ...S.td, maxWidth: 200, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{p.name}</td>
                 <td style={S.td}>{fmtN(p.systemQty)} {p.unit}</td>
                 <td style={S.td}>
@@ -3948,12 +4028,12 @@ function PartCard({ part: p, onVerify, onPhysQty, showPlant, plantsMeta }) {
       borderLeft: `4px solid ${hasDiff ? "#b91c1c" : p.verified ? "#166534" : "#e5e7eb"}`,
     }}>
       <div style={{ display: "flex", alignItems: "flex-start", gap: 10, marginBottom: 8 }}>
-        <label style={{ display: "flex", alignItems: "center", cursor: "pointer", flexShrink: 0, paddingTop: 2 }}>
+        <label style={{ display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer", flexShrink: 0, padding: 10, touchAction: "manipulation" }}>
           <input type="checkbox" checked={p.verified} onChange={e => onVerify(p.id, e.target.checked)} style={{ width: 18, height: 18 }} />
         </label>
         <div style={{ flex: 1, minWidth: 0 }}>
           <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 3 }}>
-            <span style={{ fontFamily: "monospace", fontSize: 11, color: "#6b7280" }}>{p.code}</span>
+            <span style={{ fontSize: 11, color: "#6b7280" }}>{p.code}</span>
             {showPlant && <span style={{ ...S.badge(plantsMeta[p.plantCode]?.color || "#374151", plantsMeta[p.plantCode]?.bg || "#f3f4f6"), fontSize: 9 }}>{p.plantCode}</span>}
           </div>
           <div style={{ fontSize: 13, fontWeight: 500, color: "#111827", lineHeight: 1.3 }}>{p.name}</div>
